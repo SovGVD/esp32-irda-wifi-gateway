@@ -1,4 +1,5 @@
 #include "mailnet.h"
+#include "mailoauth.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +125,11 @@ bool SmtpClient::command(const std::string &text, int expected, const char *what
         return false;
     }
     int code = reply();
+    if (code == 334 && expected != 334) {
+        // A challenge nobody asked for: a refused XOAUTH2 token comes with one
+        // (the reason, in base64). An empty line ends the exchange.
+        code = stream_.send("\r\n") ? reply() : -1;
+    }
     if (code == expected) {
         return true;
     }
@@ -131,13 +137,17 @@ bool SmtpClient::command(const std::string &text, int expected, const char *what
     return false;
 }
 
-bool SmtpClient::open(const std::string &host, uint16_t port, const std::string &user, const std::string &password) {
+bool SmtpClient::open(const std::string &host, uint16_t port, const std::string &user, const std::string &password,
+                      bool xoauth2) {
     if (!stream_.connect(host, port)) {
         error_ = "cannot connect to " + shortened(host);
         return false;
     }
     if (!command("", 220, "greeting") || !command("EHLO palm.local", 250, "hello")) {
         return false;
+    }
+    if (xoauth2) {
+        return command("AUTH XOAUTH2 " + mail_xoauth2(user, password), 235, "login");
     }
     std::string login;
     login += '\0';
@@ -373,6 +383,15 @@ bool ImapClient::command(const std::string &text, Handler handler, const char *w
             error_ = std::string("IMAP ") + what + ": " + (complete ? shortened(rest) : std::string("no answer"));
             return false;
         }
+        if (token.type == ATOM && token.text == "+") {
+            // The server waits for more from us. Only a refused XOAUTH2 token
+            // leads here (the reason follows, in base64): an empty line ends it.
+            if (!skip_line() || !stream_.send("\r\n")) {
+                error_ = std::string("IMAP ") + what + ": no answer";
+                return false;
+            }
+            continue;
+        }
         bool untagged = token.type == ATOM && token.text == "*";
         bool understood = (untagged && handler != nullptr) ? (this->*handler)() : skip_value(token) && skip_line();
         if (!understood) {
@@ -397,7 +416,8 @@ static std::string quoted(const std::string &text) {
     return out + "\"";
 }
 
-bool ImapClient::open(const std::string &host, uint16_t port, const std::string &user, const std::string &password) {
+bool ImapClient::open(const std::string &host, uint16_t port, const std::string &user, const std::string &password,
+                      bool xoauth2) {
     if (!stream_.connect(host, port)) {
         error_ = "cannot connect to " + shortened(host);
         return false;
@@ -406,6 +426,9 @@ bool ImapClient::open(const std::string &host, uint16_t port, const std::string 
     if (!stream_.line(greeting) || greeting.compare(0, 4, "* OK") != 0) {
         error_ = "IMAP greeting: " + (greeting.empty() ? std::string("no answer") : shortened(greeting));
         return false;
+    }
+    if (xoauth2) {
+        return command("AUTHENTICATE XOAUTH2 " + mail_xoauth2(user, password), nullptr, "login");
     }
     return command("LOGIN " + quoted(user) + " " + quoted(password), nullptr, "login");
 }
@@ -429,15 +452,23 @@ bool ImapClient::on_examine() {
     return skip_value(second) && skip_line();
 }
 
-bool ImapClient::examine_inbox(uint32_t *uid_validity, uint32_t *exists) {
+bool ImapClient::open_inbox(const char *text, uint32_t *uid_validity, uint32_t *exists) {
     uid_validity_ = 0;
     exists_ = 0;
-    if (!command("EXAMINE INBOX", &ImapClient::on_examine, "inbox")) {
+    if (!command(text, &ImapClient::on_examine, "inbox")) {
         return false;
     }
     *uid_validity = uid_validity_;
     *exists = exists_;
     return true;
+}
+
+bool ImapClient::examine_inbox(uint32_t *uid_validity, uint32_t *exists) {
+    return open_inbox("EXAMINE INBOX", uid_validity, exists);
+}
+
+bool ImapClient::select_inbox(uint32_t *uid_validity, uint32_t *exists) {
+    return open_inbox("SELECT INBOX", uid_validity, exists);
 }
 
 // "* 12 FETCH (UID 100 FLAGS (\Seen))"
@@ -495,6 +526,77 @@ bool ImapClient::list_newest(uint32_t exists, uint32_t count, std::vector<ImapMe
     list_ = &out;
     uint32_t first = (exists > count) ? exists - count + 1 : 1;
     return command("FETCH " + number(first) + ":" + number(exists) + " (UID FLAGS)", &ImapClient::on_list, "list");
+}
+
+static std::string uid_set(const std::vector<uint32_t> &uids) {
+    std::string text;
+    for (size_t i = 0; i < uids.size(); i++) {
+        text += (i > 0 ? "," : "") + number(uids[i]);
+    }
+    return text;
+}
+
+bool ImapClient::fetch_flags(const std::vector<uint32_t> &uids, std::vector<ImapMessage> &out) {
+    out.clear();
+    if (uids.empty()) {
+        return true;
+    }
+    list_ = &out;
+    return command("UID FETCH " + uid_set(uids) + " (UID FLAGS)", &ImapClient::on_list, "flags");
+}
+
+bool ImapClient::mark_read(const std::vector<uint32_t> &uids) {
+    return uids.empty() || command("UID STORE " + uid_set(uids) + " +FLAGS.SILENT (\\Seen)", nullptr, "mark read");
+}
+
+// "* LIST (\HasNoChildren \Trash) "/" "[Gmail]/Trash""
+bool ImapClient::on_folder() {
+    Token kind, token;
+    if (!next(kind) || kind.type == END_OF_LINE) {
+        return kind.type == END_OF_LINE;
+    }
+    if (kind.type != ATOM || strcasecmp(kind.text.c_str(), "LIST") != 0) {
+        return skip_value(kind) && skip_line();
+    }
+    if (!next(token) || token.type != OPEN) {
+        return false;
+    }
+    bool trash = false;
+    while (next(token) && token.type == ATOM) {
+        trash = trash || strcasecmp(token.text.c_str(), "\\Trash") == 0;
+    }
+    std::string delimiter, name;
+    if (token.type != CLOSE || !value(delimiter, 8) || !value(name, IMAP_STRING_MAX)) {
+        return false;
+    }
+    if (trash && trash_->empty()) {
+        *trash_ = name;
+    }
+    return skip_line();
+}
+
+bool ImapClient::find_trash(std::string &mailbox) {
+    mailbox.clear();
+    trash_ = &mailbox;
+    return command("LIST \"\" \"*\"", &ImapClient::on_folder, "folders");
+}
+
+bool ImapClient::remove(const std::vector<uint32_t> &uids, const std::string &trash) {
+    if (uids.empty()) {
+        return true;
+    }
+    std::string set = uid_set(uids);
+    if (!trash.empty()) {
+        if (command("UID MOVE " + set + " " + quoted(trash), nullptr, "delete")) {
+            return true;
+        }
+        // A server without MOVE: copy, then delete from the inbox
+        if (!command("UID COPY " + set + " " + quoted(trash), nullptr, "delete")) {
+            return false;
+        }
+    }
+    return command("UID STORE " + set + " +FLAGS.SILENT (\\Deleted)", nullptr, "delete") &&
+           command("EXPUNGE", nullptr, "delete");
 }
 
 // One body of a BODYSTRUCTURE, whose opening parenthesis was just read. Notes

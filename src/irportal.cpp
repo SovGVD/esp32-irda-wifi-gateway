@@ -69,6 +69,11 @@ static String s_request_agent;     // Browser identification, passed on by the p
 static String s_request_method;    // GET or POST
 static String s_request_body;      // Form fields of a POST, passed on by the proxy
 
+// Google sign-in from a PC: the sign-in pages answer on the Wi-Fi side while
+// this is open (opened from the Palm's Mail page, for GOOGLE_SETUP_WINDOW_MS)
+static bool s_google_window_open = false;
+static uint32_t s_google_window_since = 0;
+
 // Web proxy for all sites (see the proxy section); switched from the status page
 static bool s_proxy_all_sites = PROXY_ALL_SITES_DEFAULT;
 static bool s_wants_wml = false;
@@ -597,8 +602,9 @@ public:
         String value;      // Shown in the field, to be edited
     };
 
-    // Form with several text fields
-    void form(const String &action, const Field *fields, size_t count, const char *button) {
+    // Form with several text fields. `post` keeps the fields out of the address
+    // (HTML only; for the PC pages)
+    void form(const String &action, const Field *fields, size_t count, const char *button, bool post = false) {
         if (wml_) {
             for (size_t i = 0; i < count; i++) {
                 out_ += String("<p>") + fields[i].label + ": <input name=\"" + fields[i].name + "\" value=\"" +
@@ -610,13 +616,18 @@ public:
             }
             out_ += "</go></anchor></p>\r\n";
         } else {
-            out_ += "<FORM ACTION=\"" + action + "\" METHOD=\"GET\">\r\n";
+            out_ += "<FORM ACTION=\"" + action + "\" METHOD=\"" + (post ? "POST" : "GET") + "\">\r\n";
             for (size_t i = 0; i < count; i++) {
                 out_ += String("<P>") + fields[i].label + ": <INPUT TYPE=\"TEXT\" NAME=\"" + fields[i].name + "\" VALUE=\"" +
                         escape(fields[i].value, false) + "\"></P>\r\n";
             }
             out_ += String("<P><INPUT TYPE=\"SUBMIT\" VALUE=\"") + button + "\"></P>\r\n</FORM>\r\n";
         }
+    }
+
+    // A link that opens in a new window (HTML only; for the PC pages)
+    void link_new_window(const String &href, const String &label) {
+        out_ += "<P><A HREF=\"" + escape(href, false) + "\" TARGET=\"_blank\">" + escape(label, false) + "</A></P>\r\n";
     }
 
     void send() {
@@ -887,16 +898,24 @@ static void handle_mail() {
         page.line("No mail account entered yet.");
     } else {
         page.line("Account: " + mail.address);
-        page.line(mail.password.length() > 0 ? "Password: " + String((unsigned)mail.password.length()) + " characters stored"
-                                            : String("Password: none stored"));
+        if (mail.google()) {
+            page.line("Login: signed in with Google");
+        } else {
+            page.line(mail.password.length() > 0 ? "Password: " + String((unsigned)mail.password.length()) + " characters stored"
+                                                : String("Password: none stored"));
+        }
     }
-    page.link("/mailacct", mail.address.length() == 0 ? "Enter the account" : "Change the account");
+    page.link("/mailgoogle", mail.google() ? "Sign in with Google again (from a PC)" : "Gmail: sign in with Google (from a PC)");
+    if (mail.google()) {
+        page.link("/mailgoogleoff", "Sign out of Google");
+    }
+    page.link("/mailacct", mail.address.length() == 0 ? "Enter the account (with a password)" : "Change the account");
 
     if (irmail_ready()) {
         page.line("Mail sync: on. Tap HotSync on the Palm while no desktop program is waiting for it: "
                   "the Outbox is sent and new messages arrive in the Inbox.");
         page.link("/mailon/0", "Turn mail sync off");
-    } else if (mail.address.length() > 0 && mail.password.length() > 0) {
+    } else if (mail.address.length() > 0 && (mail.password.length() > 0 || mail.google())) {
         page.line("Mail sync: off.");
         page.link("/mailon/1", "Turn mail sync on");
     }
@@ -918,7 +937,8 @@ static void handle_mail_account() {
     Page page("Mail Account");
     const IrMailSettings &mail = irmail_settings();
 
-    page.line("With Gmail the password is an app password: Google account, Security, 2-Step Verification, App passwords.");
+    page.line("With Gmail, signing in with Google (from a PC) is easier. Otherwise the password is an app password: "
+              "Google account, Security, 2-Step Verification, App passwords.");
     if (mail.password.length() > 0) {
         page.line("Leave the password empty to keep the stored one.");
     }
@@ -947,7 +967,9 @@ static void handle_mail_account_save() {
     }
     mail.name = request_arg("n");
     mail.name.trim();
-    mail.enabled = mail.password.length() > 0;
+    irmail_store_settings(mail);
+    mail = irmail_settings(); // Another address ends a Google sign-in
+    mail.enabled = mail.password.length() > 0 || mail.google();
     irmail_store_settings(mail);
 
     // Graffiti slips are easy: show how much was understood
@@ -993,7 +1015,7 @@ static void handle_mail_test() {
     Page page("Mail Login");
     const IrMailSettings &mail = irmail_settings();
 
-    if (mail.address.length() == 0 || mail.password.length() == 0) {
+    if (mail.address.length() == 0 || (mail.password.length() == 0 && !mail.google())) {
         page.line("Enter the account first.");
     } else {
         String receiving, sending;
@@ -1003,6 +1025,124 @@ static void handle_mail_test() {
     }
     page.link("/mail", "Back");
     page.send();
+}
+
+// The Palm cannot show Google's sign-in page: open the sign-in pages to a PC on
+// the same Wi-Fi for a while, and say where to find them
+static void handle_mail_google() {
+    Page page("Sign in with Google");
+
+    if (WiFi.status() != WL_CONNECTED) {
+        page.line("Wi-Fi is not connected: the PC must reach the adapter over Wi-Fi.");
+    } else {
+        s_google_window_open = true;
+        s_google_window_since = millis();
+        page.line("On a PC on the same Wi-Fi (" + WiFi.SSID() + "), open within " +
+                  String((unsigned)(GOOGLE_SETUP_WINDOW_MS / 60000)) + " minutes:");
+        page.line("http://" + WiFi.localIP().toString() + "/google");
+        page.line("You need your own Google OAuth client (client ID and secret): see the README, Mail, Sign in with Google.");
+    }
+    page.link("/mail", "Back");
+    page.send();
+}
+
+static void handle_mail_google_off() {
+    Page page("Mail");
+    irmail_google_sign_out();
+    page.line("Signed out. The adapter no longer uses the Google sign-in.");
+    page.line("To remove its access completely: Google account, Security, Your connections to third-party apps.");
+    page.link("/mail", "Back");
+    page.send();
+}
+
+// ------------------------------------------------------------------------------
+// Google Sign-In Pages (for a PC on the Wi-Fi side, while opened from the Palm)
+// ------------------------------------------------------------------------------
+
+static void pc_google_form(Page &page, const String &address, const String &client_id) {
+    const Page::Field fields[] = {{"a", "Gmail address", address},
+                                  {"i", "Client ID", client_id},
+                                  {"s", "Client secret", ""}};
+    page.form("/googlestart", fields, 3, "Continue", true);
+}
+
+static void handle_pc_google() {
+    Page page("Gmail: Sign in with Google");
+    const IrMailSettings &mail = irmail_settings();
+
+    if (mail.google()) {
+        page.line("Signed in as " + mail.address + ". Signing in again replaces that.");
+    }
+    page.line("1. In the Google Cloud console, create an OAuth client of type \"Desktop app\" "
+              "(the README, Mail, Sign in with Google, has the steps), and enter it here:");
+    pc_google_form(page, mail.address, mail.google_client_id);
+    page.send();
+}
+
+static void handle_pc_google_start() {
+    Page page("Gmail: Sign in with Google");
+
+    String address = request_arg("a");
+    String client_id = request_arg("i");
+    String client_secret = request_arg("s");
+    address.trim();
+    client_id.trim();
+    client_secret.trim();
+    if (address.indexOf('@') < 1 || address.indexOf(' ') >= 0 || client_id.length() == 0 || client_secret.length() == 0) {
+        page.line("Enter the Gmail address, the client ID and the client secret.");
+        pc_google_form(page, address, client_id);
+        page.send();
+        return;
+    }
+
+    String consent = irmail_google_begin(address, client_id, client_secret);
+    page.line("2. Open Google's page, sign in as " + address + " and allow access. Google warns that the app is not "
+              "verified: it is your own client, choose Continue.");
+    page.link_new_window(consent, "Open Google's sign-in page");
+    page.line("3. Google then sends the browser to http://127.0.0.1/..., which does not load. "
+              "Copy the whole address from the address bar and paste it here:");
+    const Page::Field fields[] = {{"u", "Address", ""}};
+    page.form("/googledone", fields, 1, "Finish", true);
+    page.send();
+}
+
+static void handle_pc_google_done() {
+    Page page("Gmail: Sign in with Google");
+
+    String message;
+    if (!irmail_google_finish(request_arg("u"), message)) {
+        page.line(message);
+        page.link("/google", "Start again");
+        page.send();
+        return;
+    }
+    page.line(message);
+    String receiving, sending;
+    irmail_check_login(receiving, sending);
+    page.line("Receiving: " + receiving);
+    page.line("Sending: " + sending);
+    page.line("You can close this page. Tap HotSync on the Palm to sync mail.");
+    s_google_window_open = false; // Done: the Wi-Fi side is shut out again
+    page.send();
+}
+
+// A request from the Wi-Fi side: answered only for the sign-in pages, while
+// they are open. Returns false if it is not one of those.
+static bool serve_pc_request() {
+    if (!s_google_window_open || millis() - s_google_window_since > GOOGLE_SETUP_WINDOW_MS) {
+        s_google_window_open = false;
+        return false;
+    }
+    String path = s_target;
+    int query = path.indexOf('?');
+    if (query >= 0) {
+        path = path.substring(0, query);
+    }
+    if (path == "/google") handle_pc_google();
+    else if (path == "/googlestart") handle_pc_google_start();
+    else if (path == "/googledone") handle_pc_google_done();
+    else return false;
+    return true;
 }
 
 // ------------------------------------------------------------------------------
@@ -1469,7 +1609,7 @@ static void proxy_fetch(const String &first_url) {
 // HTTP Server (deliberately simple and forgiving, for 1990s browsers)
 // ------------------------------------------------------------------------------
 
-#define HTTP_REQUEST_MAX     1024  // Bytes of request kept (request line and headers)
+#define HTTP_REQUEST_MAX     4096  // Bytes of request kept (request line, headers, form fields)
 #define HTTP_READ_TIMEOUT_S  4     // Wait for the request to arrive
 #define HTTP_CLOSE_TIMEOUT_S 2     // Wait for the client to close after our reply
 
@@ -1544,6 +1684,8 @@ static void route_request() {
     else if (path == "/mailsrv") handle_mail_servers(false);
     else if (path == "/mailsrvsave") handle_mail_servers(true);
     else if (path == "/mailtest") handle_mail_test();
+    else if (path == "/mailgoogle") handle_mail_google();
+    else if (path == "/mailgoogleoff") handle_mail_google_off();
     else if ((path == "/mailon" || path == "/mailtext") && indexed && index >= 0 && index <= 1) {
         IrMailSettings mail = irmail_settings();
         if (path == "/mailon") {
@@ -1695,9 +1837,12 @@ static void serve_client() {
     }
 #endif
 
-    // The portal is for the Palm only: refuse anything arriving from the Wi-Fi side
+    // The portal is for the Palm only: refuse anything arriving from the Wi-Fi
+    // side, but for the Google sign-in pages while the Palm has them open
     if (s_client_ip == 0 || s_client_ip != irppp_palm_ip()) {
-        respond("403 Forbidden", "text/plain", "Forbidden\r\n");
+        if (!serve_pc_request()) {
+            respond("403 Forbidden", "text/plain", "Forbidden\r\n");
+        }
         return;
     }
     route_request();

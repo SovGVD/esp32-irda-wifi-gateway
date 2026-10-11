@@ -1,0 +1,118 @@
+{
+ "ok": true,
+ "ended": 0,
+ "sync_log": [
+  "Mail: 2 sent, 2 received, 5 read or deleted\n"
+ ],
+ "tickles": 0,
+ "records": [
+  {
+   "id": 11534337,
+   "attr": 0,
+   "category": 0,
+   "data": "f54b09008400412072656164206f6e207468652050616c6d00616e6e406578616d706c652e636f6d006d6540676d61696c2e636f6d0000000000426f6479206f6620412072656164206f6e207468652050616c6d00",
+   "mail": {
+    "date": "2026-10-11 09:00",
+    "flags": "0x84",
+    "subject": "A read on the Palm",
+    "from": "ann@example.com",
+    "to": "me@gmail.com",
+    "cc": "",
+    "bcc": "",
+    "reply_to": "",
+    "sent_to": "",
+    "body": "Body of A read on the Palm"
+   }
+  },
+  {
+   "id": 11534339,
+   "attr": 0,
+   "category": 0,
+   "data": "f54b0900840043207265616420656c7365776865726500616e6e406578616d706c652e636f6d006d6540676d61696c2e636f6d0000000000426f6479206f662043207265616420656c7365776865726500",
+   "mail": {
+    "date": "2026-10-11 09:00",
+    "flags": "0x84",
+    "subject": "C read elsewhere",
+    "from": "ann@example.com",
+    "to": "me@gmail.com",
+    "cc": "",
+    "bcc": "",
+    "reply_to": "",
+    "sent_to": "",
+    "body": "Body of C read elsewhere"
+   }
+  },
+  {
+   "id": 11534342,
+   "attr": 0,
+   "category": 3,
+   "data": "f54b09000400462066696c6564206f6e207468652050616c6d00616e6e406578616d706c652e636f6d006d6540676d61696c2e636f6d0000000000426f6479206f6620462066696c6564206f6e207468652050616c6d00",
+   "mail": {
+    "date": "2026-10-11 09:00",
+    "flags": "0x04",
+    "subject": "F filed on the Palm",
+    "from": "ann@example.com",
+    "to": "me@gmail.com",
+    "cc": "",
+    "bcc": "",
+    "reply_to": "",
+    "sent_to": "",
+    "body": "Body of F filed on the Palm"
+   }
+  },
+  {
+   "id": 11534343,
+   "attr": 0,
+   "category": 0,
+   "data": "f54b090004004720756e6368616e67656400616e6e406578616d706c652e636f6d006d6540676d61696c2e636f6d0000000000426f6479206f66204720756e6368616e67656400",
+   "mail": {
+    "date": "2026-10-11 09:00",
+    "flags": "0x04",
+    "subject": "G unchanged",
+    "from": "ann@example.com",
+    "to": "me@gmail.com",
+    "cc": "",
+    "bcc": "",
+    "reply_to": "",
+    "sent_to": "",
+    "body": "Body of G unchanged"
+   }
+  },
+  {
+   "id": 10485763,
+   "attr": 0,
+   "category": 0,
+   "data": "f54b121e04004c756e63682028746f6d6f72726f77292022617422207b31327d00416e6e204dfc6c6c6572203c616e6e406578616d706c652e636f6d3e006d6540676d61696c2e636f6d00426f62203c626f62406578616d706c652e6f72673e00000000436166e9206174206e6f6f6e3f0a29206e6f742074686520656e6400",
+   "mail": {
+    "date": "2026-10-11 18:30",
+    "flags": "0x04",
+    "subject": "Lunch (tomorrow) \"at\" {12}",
+    "from": "Ann M\u00fcller <ann@example.com>",
+    "to": "me@gmail.com",
+    "cc": "Bob <bob@example.org>",
+    "bcc": "",
+    "reply_to": "",
+    "sent_to": "",
+    "body": "Caf\u00e9 at noon?\n) not the end"
+   }
+  },
+  {
+   "id": 10485764,
+   "attr": 0,
+   "category": 0,
+   "data": "f54b0105800053616c652096203530250073686f70406578616d706c652e636f6d0000000068656c70406578616d706c652e636f6d000048656c6c6f2050616c6d0a0a5365636f6e642070617261677261706800",
+   "mail": {
+    "date": "2026-10-11 01:05",
+    "flags": "0x80",
+    "subject": "Sale \u0096 50%",
+    "from": "shop@example.com",
+    "to": "",
+    "cc": "",
+    "bcc": "",
+    "reply_to": "help@example.com",
+    "sent_to": "",
+    "body": "Hello Palm\n\nSecond paragraph"
+   }
+  }
+ ]
+}

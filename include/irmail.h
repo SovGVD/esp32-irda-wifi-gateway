@@ -17,6 +17,12 @@ struct IrMailSettings {
     String imap_host;  // "host" or "host:port"
     String smtp_host;
     bool cyrillic = false; // The Palm shows Windows-1251 text instead of Western
+    // Google sign-in instead of the password (Gmail): the owner's own OAuth
+    // client, and the refresh token got when signing in from a PC
+    String google_client_id;
+    String google_client_secret;
+    String google_token;
+    bool google() const { return google_token.length() > 0; }
 };
 
 void irmail_init();
@@ -29,6 +35,15 @@ bool irmail_ready();            // Switched on, with an account to use
 String irmail_last_result();    // Outcome of the last sync, for the portal
 // Tries to log in to both servers; one line of text for each
 void irmail_check_login(String &receiving, String &sending);
+
+// Google sign-in, done once from a PC browser (portal). The first call gives
+// the address of Google's consent page; after the consent the owner pastes
+// the address the browser was sent back to, and the second call trades the
+// code in it for a refresh token and stores the account. `message` is a line
+// for the page either way.
+String irmail_google_begin(const String &address, const String &client_id, const String &client_secret);
+bool irmail_google_finish(const String &pasted, String &message);
+void irmail_google_sign_out();
 
 // A HotSync session handled by the conduit. `opening` is what the Palm sent
 // before the session was handed over. Returns false while an earlier sync is
