@@ -2,6 +2,7 @@
 #include "irdebug.h"
 #include "hotsync.h"
 #include "mailsync.h"
+#include "mailoauth.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
@@ -42,6 +43,9 @@ static void load_settings() {
     s_settings.imap_host = prefs.getString("imap", MAIL_DEFAULT_IMAP_SERVER);
     s_settings.smtp_host = prefs.getString("smtp", MAIL_DEFAULT_SMTP_SERVER);
     s_settings.cyrillic = prefs.getUChar("cset", 0) != 0;
+    s_settings.google_client_id = prefs.getString("gid", "");
+    s_settings.google_client_secret = prefs.getString("gsecret", "");
+    s_settings.google_token = prefs.getString("gtoken", "");
     prefs.end();
 }
 
@@ -58,9 +62,13 @@ void irmail_forget_position() {
 }
 
 // Not called while a sync runs: the portal and HotSync cannot share the Palm's infrared link
-void irmail_store_settings(const IrMailSettings &settings) {
+void irmail_store_settings(const IrMailSettings &new_settings) {
+    IrMailSettings settings = new_settings;
     bool other_mailbox = settings.address != s_settings.address || settings.login != s_settings.login ||
                          settings.imap_host != s_settings.imap_host;
+    if (other_mailbox && settings.google_token == s_settings.google_token) {
+        settings.google_token = ""; // The Google sign-in was for the other account
+    }
     s_settings = settings;
 
     Preferences prefs;
@@ -73,6 +81,9 @@ void irmail_store_settings(const IrMailSettings &settings) {
     prefs.putString("imap", settings.imap_host);
     prefs.putString("smtp", settings.smtp_host);
     prefs.putUChar("cset", settings.cyrillic ? 1 : 0);
+    prefs.putString("gid", settings.google_client_id);
+    prefs.putString("gsecret", settings.google_client_secret);
+    prefs.putString("gtoken", settings.google_token);
     prefs.end();
     if (other_mailbox) {
         irmail_forget_position();
@@ -80,7 +91,8 @@ void irmail_store_settings(const IrMailSettings &settings) {
 }
 
 bool irmail_ready() {
-    return s_from_palm != nullptr && s_settings.enabled && s_settings.address.length() > 0 && s_settings.password.length() > 0;
+    return s_from_palm != nullptr && s_settings.enabled && s_settings.address.length() > 0 &&
+           (s_settings.password.length() > 0 || s_settings.google());
 }
 
 String irmail_last_result() {
@@ -190,12 +202,24 @@ void irmail_check_login(String &receiving, String &sending) {
     s_stop = false;
     std::string host;
     uint16_t port;
+    std::string password = s_settings.password.c_str();
+    if (s_settings.google()) {
+        TlsConnection connection;
+        OAuthClient google(connection, nullptr);
+        OAuthTokens tokens;
+        if (!google.refresh(s_settings.google_client_id.c_str(), s_settings.google_client_secret.c_str(),
+                            s_settings.google_token.c_str(), tokens)) {
+            receiving = sending = google.error().c_str();
+            return;
+        }
+        password = tokens.access_token;
+    }
     {
         TlsConnection connection;
         ImapClient imap(connection, nullptr);
         uint32_t validity = 0, exists = 0;
         split_server(s_settings.imap_host, MAIL_IMAP_PORT, host, port);
-        if (imap.open(host, port, login_name(), s_settings.password.c_str()) && imap.examine_inbox(&validity, &exists)) {
+        if (imap.open(host, port, login_name(), password, s_settings.google()) && imap.examine_inbox(&validity, &exists)) {
             receiving = "OK, " + String((unsigned long)exists) + " messages in the inbox.";
             imap.close();
         } else {
@@ -206,13 +230,97 @@ void irmail_check_login(String &receiving, String &sending) {
         TlsConnection connection;
         SmtpClient smtp(connection, nullptr);
         split_server(s_settings.smtp_host, MAIL_SMTP_PORT, host, port);
-        if (smtp.open(host, port, login_name(), s_settings.password.c_str())) {
+        if (smtp.open(host, port, login_name(), password, s_settings.google())) {
             sending = "OK.";
             smtp.close();
         } else {
             sending = smtp.error().c_str();
         }
     }
+}
+
+// ------------------------------------------------------------------------------
+// Google Sign-In (from a PC browser, through the portal)
+// ------------------------------------------------------------------------------
+
+// The sign-in in progress: what was entered, and the PKCE verifier whose
+// challenge went into the consent address
+static String s_pending_address;
+static String s_pending_client_id;
+static String s_pending_client_secret;
+static std::string s_pending_verifier;
+static std::string s_pending_state;
+
+// Characters allowed in a PKCE verifier (and used for the state as well)
+static std::string random_text(size_t len) {
+    static const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    std::string text;
+    for (size_t i = 0; i < len; i++) {
+        text += chars[esp_random() % (sizeof(chars) - 1)];
+    }
+    return text;
+}
+
+String irmail_google_begin(const String &address, const String &client_id, const String &client_secret) {
+    s_pending_address = address;
+    s_pending_client_id = client_id;
+    s_pending_client_secret = client_secret;
+    s_pending_verifier = random_text(64);
+    s_pending_state = random_text(16);
+    return oauth_consent_url(client_id.c_str(), GOOGLE_SCOPES, oauth_pkce_challenge(s_pending_verifier), s_pending_state,
+                             address.c_str()).c_str();
+}
+
+bool irmail_google_finish(const String &pasted, String &message) {
+    if (s_pending_verifier.empty()) {
+        message = "No sign-in was started (or the adapter restarted since): start again.";
+        return false;
+    }
+    if (s_running) {
+        message = "A mail sync is running: try again when it is done.";
+        return false;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        message = "Wi-Fi is not connected.";
+        return false;
+    }
+    std::string code, problem;
+    if (!oauth_code_from_reply(pasted.c_str(), s_pending_state, code, problem)) {
+        message = problem.c_str();
+        return false;
+    }
+
+    s_stop = false;
+    TlsConnection connection;
+    OAuthClient google(connection, nullptr);
+    OAuthTokens tokens;
+    if (!google.exchange_code(s_pending_client_id.c_str(), s_pending_client_secret.c_str(), code, s_pending_verifier, tokens)) {
+        message = google.error().c_str();
+        return false;
+    }
+    if (tokens.refresh_token.empty()) {
+        message = "Google gave no refresh token. Remove the adapter's access in your Google account and sign in again.";
+        return false;
+    }
+    s_pending_verifier.clear(); // A code works only once
+
+    IrMailSettings settings = s_settings;
+    settings.address = s_pending_address;
+    settings.login = "";
+    settings.google_client_id = s_pending_client_id;
+    settings.google_client_secret = s_pending_client_secret;
+    settings.google_token = tokens.refresh_token.c_str();
+    settings.enabled = true;
+    irmail_store_settings(settings);
+    message = "Signed in as " + s_pending_address + ". Mail sync is on.";
+    return true;
+}
+
+void irmail_google_sign_out() {
+    IrMailSettings settings = s_settings;
+    settings.google_token = "";
+    settings.enabled = settings.password.length() > 0;
+    irmail_store_settings(settings);
 }
 
 // ------------------------------------------------------------------------------
@@ -301,6 +409,11 @@ static void run_sync() {
         setup.name = s_settings.name.c_str();
         setup.login = login_name();
         setup.password = s_settings.password.c_str();
+        if (s_settings.google()) {
+            setup.oauth_client_id = s_settings.google_client_id.c_str();
+            setup.oauth_client_secret = s_settings.google_client_secret.c_str();
+            setup.oauth_refresh_token = s_settings.google_token.c_str();
+        }
         split_server(s_settings.imap_host, MAIL_IMAP_PORT, setup.imap_host, setup.imap_port);
         split_server(s_settings.smtp_host, MAIL_SMTP_PORT, setup.smtp_host, setup.smtp_port);
         setup.charset = s_settings.cyrillic ? PALM_CYRILLIC : PALM_WESTERN;

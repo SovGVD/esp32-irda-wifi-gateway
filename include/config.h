@@ -145,7 +145,7 @@
 // HotSync starts and the USB host does not answer it, the adapter answers it
 // itself: it sends the Outbox through SMTP and copies new messages from an
 // IMAP inbox to the Palm. The account is entered in the portal (needs the
-// Wi-Fi gateway above); with Gmail the password is an "app password".
+// Wi-Fi gateway above); with Gmail, sign in with Google or use an "app password".
 #define MAIL_PC_ANSWER_TIMEOUT_MS  1500   // A desktop that is listening answers within milliseconds
 #define MAIL_ACCEPT_TIMEOUT_MS     10000  // Wait for the Palm's wake-up packet once a session is ours
 
@@ -163,6 +163,13 @@
 #define MAIL_MAX_SEND_PER_SYNC     10
 // A message that only exists as HTML: bytes read to find its text
 #define MAIL_HTML_FETCH_MAX        96000
+
+// Google sign-in (OAuth) instead of an app password, for Gmail. The owner
+// signs in once from a PC on the same Wi-Fi: "Sign in with Google" on the
+// Mail page opens the adapter's sign-in page to the Wi-Fi side for this long.
+// Only the mail scope for now; adding scopes later means signing in again.
+#define GOOGLE_SCOPES              "https://mail.google.com/"
+#define GOOGLE_SETUP_WINDOW_MS     (15UL * 60 * 1000)
 
 // Time server; message dates are converted to the time shown by the Palm's clock
 #define MAIL_NTP_SERVER            "pool.ntp.org"

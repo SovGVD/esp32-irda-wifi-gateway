@@ -1,5 +1,6 @@
 #include "mailsync.h"
 #include "hotsync.h"
+#include "mailoauth.h"
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -12,6 +13,8 @@
 
 static const MailSyncSetup *s_setup = nullptr;
 static MailSyncHost *s_host = nullptr;
+static std::string s_access_token;  // Google sign-in: fetched once per sync, when first needed
+static std::string s_sign_in_error; // ... or why that failed (not tried again in the same sync)
 
 static std::string number(unsigned long value) {
     char text[12];
@@ -28,6 +31,34 @@ static void note_problem(MailSyncResult &outcome, const std::string &problem) {
 
 static bool link_lost() {
     return hotsync_error() == HOTSYNC_ERR_LINK;
+}
+
+static bool google_login() {
+    return !s_setup->oauth_refresh_token.empty();
+}
+
+// The password for the servers: with Google sign-in, an access token fetched
+// from the token server first (over the same connection, before the mail server)
+static bool sign_in(std::string &error) {
+    if (!google_login() || !s_access_token.empty()) {
+        return true;
+    }
+    if (!s_sign_in_error.empty()) {
+        error = s_sign_in_error;
+        return false;
+    }
+    OAuthClient google(s_host->connection(), hotsync_keep_alive);
+    OAuthTokens tokens;
+    if (!google.refresh(s_setup->oauth_client_id, s_setup->oauth_client_secret, s_setup->oauth_refresh_token, tokens)) {
+        error = s_sign_in_error = google.error();
+        return false;
+    }
+    s_access_token = tokens.access_token;
+    return true;
+}
+
+static const std::string &password() {
+    return google_login() ? s_access_token : s_setup->password;
 }
 
 static std::string capped(const std::string &text, size_t max_len) {
@@ -52,8 +83,14 @@ static void send_outbox(uint8_t db, const std::string &signature, int64_t now, i
         return;
     }
 
+    std::string error;
+    if (!sign_in(error)) {
+        outcome.not_sent = ids.size();
+        note_problem(outcome, error);
+        return;
+    }
     SmtpClient smtp(s_host->connection(), hotsync_keep_alive);
-    if (!smtp.open(s_setup->smtp_host, s_setup->smtp_port, s_setup->login, s_setup->password)) {
+    if (!smtp.open(s_setup->smtp_host, s_setup->smtp_port, s_setup->login, password(), google_login())) {
         outcome.not_sent = ids.size();
         note_problem(outcome, smtp.error());
         return;
@@ -106,10 +143,15 @@ static void fetch_inbox(uint8_t db, const MailSyncOptions &options, int offset_m
         note_problem(outcome, "Wi-Fi is not connected");
         return;
     }
+    std::string error;
+    if (!sign_in(error)) {
+        note_problem(outcome, error);
+        return;
+    }
     ImapClient imap(s_host->connection(), hotsync_keep_alive);
     uint32_t uid_validity = 0, exists = 0;
     std::vector<ImapMessage> newest;
-    if (!imap.open(s_setup->imap_host, s_setup->imap_port, s_setup->login, s_setup->password) ||
+    if (!imap.open(s_setup->imap_host, s_setup->imap_port, s_setup->login, password(), google_login()) ||
         !imap.examine_inbox(&uid_validity, &exists) || !imap.list_newest(exists, s_setup->max_fetch, newest)) {
         note_problem(outcome, imap.error());
         return;
@@ -213,6 +255,8 @@ static int palm_utc_offset(int64_t now) {
 void mailsync_run(const MailSyncSetup &setup, MailSyncHost &host, MailSyncResult &outcome) {
     s_setup = &setup;
     s_host = &host;
+    s_access_token.clear();
+    s_sign_in_error.clear();
     outcome = MailSyncResult();
     hotsync_open_conduit();
 

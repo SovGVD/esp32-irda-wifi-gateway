@@ -311,12 +311,36 @@ No computer is involved; the adapter only needs USB power and a saved Wi-Fi netw
 ### 1. Enter the account
 Connect the Palm to the network as described above, open **`http://wifi.setup/`** and follow **Mail**:
 
-- **Enter the account:** e-mail address, password, and the name recipients should see.
-- With **Gmail** the password must be an *app password*: Google account → Security → 2-Step Verification → App passwords. Google refuses the normal account password here. It is 16 lower-case letters.
+- **Gmail:** sign in with Google from a PC, once (see "Sign in with Google" below). This needs no app password.
+- **Enter the account** (any provider, or Gmail with an app password): e-mail address, password, and the name recipients should see.
+- With **Gmail** a password must be an *app password*: Google account → Security → 2-Step Verification → App passwords. Google refuses the normal account password here. It is 16 lower-case letters. Accounts without 2-Step Verification, with Advanced Protection, or managed by an organisation that blocks them cannot create one: use "Sign in with Google" instead.
 - For **other providers**, open "Servers" and enter the IMAP and SMTP server names. Both are contacted with TLS from the first byte, on ports 993 and 465 (another port can be given as `server:port`; STARTTLS on ports 143 / 587 is not supported).
 - **Check the login now** tries both servers and shows what they answer.
 
 Then tap **Disconnect** in Prefs → Network: HotSync needs the infrared link for itself.
+
+### Sign in with Google (Gmail)
+The adapter logs in to Gmail with Google's own sign-in (OAuth, SASL XOAUTH2) instead of a password. Google's sign-in page needs a modern browser, so this is done once from a PC on the same Wi-Fi network. Each owner uses their own Google "OAuth client": an app used only by its owner needs no review by Google.
+
+**A. Create the OAuth client** (once, at [console.cloud.google.com](https://console.cloud.google.com/), signed in with any Google account):
+1. Create a project (top bar → project list → New project), for example "Palm mail".
+2. APIs & Services → Library → **Gmail API** → Enable.
+3. Google Auth Platform (or "OAuth consent screen") → Get started: an app name, your e-mail address as support and contact address, Audience **External**.
+4. Audience → **Publish app**, so that its status is **In production**. Leave it unverified. In "Testing" status Google ends the sign-in after 7 days.
+5. Clients → Create client → Application type **Desktop app** → Create. Keep the **Client ID** and **Client secret** it shows.
+
+**B. Sign in:**
+1. On the Palm, on the portal's Mail page, tap **Gmail: sign in with Google (from a PC)**. The page shows an address such as `http://192.168.1.50/google`. For the next 15 minutes the adapter answers that page on the Wi-Fi side; at all other times only the Palm reaches the portal.
+2. Open that address on the PC. Enter the Gmail address, the client ID and the client secret, and press **Continue**.
+3. Press **Open Google's sign-in page**, choose the Gmail account and allow access. Google warns that it "hasn't verified this app": it is your own client, so choose Continue (under "Advanced" in some versions).
+4. Google then sends the browser to `http://127.0.0.1/?state=...&code=...`, a page that does not load. That is expected: copy the whole address from the address bar, paste it into the adapter's page and press **Finish**.
+5. The page then logs in to both servers and shows the outcome. Mail sync is on; tap HotSync on the Palm.
+
+**Notes:**
+- The adapter keeps the "refresh token" Google gives it, and gets a fresh access token from Google at the start of each sync. The token, client ID and secret are stored unencrypted in the ESP32's flash, like the Wi-Fi passwords. The token gives full access to the mailbox (IMAP and SMTP accept no narrower permission).
+- Google ends a sign-in when the account's password is changed, when access is removed (Google account → Security → Your connections to third-party apps), when it has not been used for six months, or after 7 days if the app is still in "Testing". The HotSync log then says `Google sign-in no longer valid, sign in again from a PC`: repeat step B.
+- **Sign out of Google** on the Mail page makes the adapter forget the token; the account's own security page removes the access on Google's side.
+- Changing the e-mail address on the Palm ends the Google sign-in (it belonged to the other account).
 
 ### 2. Synchronise
 In the **HotSync** application choose "IR to a PC/Handheld" and tap the HotSync icon, exactly as for a desktop sync.
@@ -338,7 +362,7 @@ The outcome is written to the **HotSync log** on the Palm (HotSync → Log), for
 - Dates are shown in the Palm's time. The adapter gets the time from the network and takes the time zone from the Palm's clock, so set that clock correctly.
 
 ### Notes
-- The password is stored unencrypted in the ESP32's flash, like the Wi-Fi passwords. An app password can be revoked at any time; a mail account used only for the Palm limits the exposure further.
+- The password (or the Google sign-in token) is stored unencrypted in the ESP32's flash, like the Wi-Fi passwords. Both can be revoked at any time; a mail account used only for the Palm limits the exposure further.
 - The mail servers' certificates are checked (unlike the web proxy's).
 - Keep the IR ports aligned until the Palm reports that the HotSync is complete.
 - "Fetch the newest messages again" on the Mail page makes the next sync start over, for example after emptying the Palm's Inbox.
@@ -378,6 +402,8 @@ All settings are in `include/config.h`.
 | `MAIL_DEFAULT_IMAP_SERVER` / `MAIL_DEFAULT_SMTP_SERVER` | Gmail's | Mail servers until others are entered in the portal |
 | `MAIL_MAX_PER_SYNC` / `MAIL_MAX_SEND_PER_SYNC` | 15 / 10 | Newest inbox messages looked at, and Outbox messages sent, per sync |
 | `MAIL_HTML_FETCH_MAX` | 96000 | Bytes read of a message that only exists as HTML |
+| `GOOGLE_SCOPES` | `https://mail.google.com/` | Access asked for when signing in with Google |
+| `GOOGLE_SETUP_WINDOW_MS` | 15 minutes | How long the sign-in page answers on the Wi-Fi side once opened from the Palm |
 | `MAIL_NTP_SERVER` | `pool.ntp.org` | Time server (for message dates) |
 | `ENABLE_CDC_DEBUG` | 0 | Print a protocol trace on USB instead of serial data |
 | `CURRENT_OP_MODE` | `MODE_IRCOMM` | `MODE_RAW_SIR` turns the adapter into a plain IR pulse bridge without the IrDA stack |
@@ -410,7 +436,8 @@ All settings are in `include/config.h`.
 - **A HotSync meant for the computer turned into a mail sync:**
   - The desktop program was not waiting yet. Start `pilot-xfer` (or the sync in `jpilot`) first, then tap HotSync; or turn mail sync off on the portal's Mail page.
 - **The mail sync reports a problem (HotSync log on the Palm, or the portal's Mail page):**
-  - `IMAP login: ...` / `SMTP login: ...`: the server refused the password. With Gmail it must be an app password; "Check the login now" on the Mail page tests it without a HotSync.
+  - `IMAP login: ...` / `SMTP login: ...`: the server refused the password. With Gmail it must be an app password, or use "Sign in with Google"; "Check the login now" on the Mail page tests it without a HotSync.
+  - `Google sign-in no longer valid, sign in again from a PC`: Google ended the sign-in (see "Sign in with Google", Notes). `Google sign-in: invalid_client`: the client ID or secret is wrong, or the client was deleted.
   - `cannot connect to ...`: wrong server name, a server without TLS on that port, or a certificate that cannot be verified.
   - `Wi-Fi is not connected`: check the status page of the portal.
 - **The Palm reports a HotSync connection error with mail set up:**
@@ -428,8 +455,9 @@ test/host/run.sh
 
 - **HotSync protocols:** the firmware's code talks to a simulated Palm (`test/host/fake_palm.py`) over a pseudo terminal. The requests it sends must be byte for byte those that `pilot-link` sent to the same simulated Palm for the same steps (recorded in `test/host/data/`). The sync is repeated with every single packet lost once, in either direction.
 - **Mail text:** records of the Mail database, character sets, MIME encodings, HTML to text, headers, dates.
-- **IMAP and SMTP clients:** against scripted servers that answer as Gmail does, with the answers arriving whole and one byte at a time.
-- **Whole mail syncs:** the conduit between the simulated Palm and the scripted servers; what the Palm holds afterwards is compared with the expected contents.
+- **IMAP and SMTP clients:** against scripted servers that answer as Gmail does, with the answers arriving whole and one byte at a time; with passwords and with Google sign-in (XOAUTH2).
+- **Google sign-in:** the consent address, the PKCE challenge (RFC 7636 example), taking the code from a pasted address, and the token server's answers (tokens, revoked token, wrong client).
+- **Whole mail syncs:** the conduit between the simulated Palm and the scripted servers, with a password and with Google sign-in; what the Palm holds afterwards is compared with the expected contents.
 
 ---
 
@@ -455,6 +483,7 @@ irda-esp32/
 │   ├── hotsync.h          # HotSync from the desktop's side (SLP, PADP, CMP, DLP)
 │   ├── mailsync.h         # The mail conduit (Outbox to SMTP, IMAP inbox to Inbox)
 │   ├── mailnet.h          # IMAP and SMTP clients
+│   ├── mailoauth.h        # Google sign-in (OAuth tokens, XOAUTH2)
 │   ├── mailtext.h         # Mail records, character sets, MIME, headers, dates
 │   └── irdebug.h          # Protocol trace
 ├── src/
@@ -468,6 +497,7 @@ irda-esp32/
 │   ├── hotsync.cpp        # HotSync protocols, as pilot-link speaks them
 │   ├── mailsync.cpp       # Steps of a mail sync
 │   ├── mailnet.cpp        # IMAP and SMTP
+│   ├── mailoauth.cpp      # Google's token server, consent address, PKCE
 │   ├── mailtext.cpp       # Conversion between Mail records and Internet mail
 │   ├── irdebug.cpp        # Protocol trace buffer
 │   └── main.cpp           # IrLAP state machine; routes each session to USB, Wi-Fi or mail

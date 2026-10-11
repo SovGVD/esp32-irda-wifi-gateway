@@ -48,7 +48,9 @@ class SmtpClient {
 public:
     SmtpClient(MailConnection &conn, void (*idle)()) : stream_(conn, idle) {}
 
-    bool open(const std::string &host, uint16_t port, const std::string &user, const std::string &password);
+    // xoauth2: `password` is a Google access token (see mailoauth.h)
+    bool open(const std::string &host, uint16_t port, const std::string &user, const std::string &password,
+              bool xoauth2 = false);
     // `message`: headers and body with CRLF line ends, as mail_compose() builds it
     bool send(const std::string &from, const std::vector<std::string> &recipients, const std::string &message);
     void close();
@@ -81,7 +83,9 @@ class ImapClient {
 public:
     ImapClient(MailConnection &conn, void (*idle)()) : stream_(conn, idle) {}
 
-    bool open(const std::string &host, uint16_t port, const std::string &user, const std::string &password);
+    // xoauth2: `password` is a Google access token (see mailoauth.h)
+    bool open(const std::string &host, uint16_t port, const std::string &user, const std::string &password,
+              bool xoauth2 = false);
     // Opens the inbox read-only: nothing this client does changes the mailbox
     bool examine_inbox(uint32_t *uid_validity, uint32_t *exists);
     // The newest `count` messages, oldest first (deleted ones left out)
