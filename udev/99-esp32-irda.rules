@@ -1,0 +1,12 @@
+# udev rules for ESP32-C3 IrDA Serial Device
+# Copy this file to /etc/udev/rules.d/99-esp32-irda.rules
+# and reload udev:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# 1. ESP32-C3 Built-in Native USB CDC (Espressif Vendor ID: 303a, Product ID: 1001)
+# Prevent ModemManager from capturing and sending AT probe commands:
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{ID_MM_PORT_IGNORE}="1"
+
+# Set read/write permissions for dialout group and create symlink /dev/palm-irda
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", MODE="0666", GROUP="dialout", SYMLINK+="palm-irda"
+

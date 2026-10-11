@@ -1,0 +1,385 @@
+# ESP32-C3 IrDA Adapter for the Palm IIIx: HotSync over USB and Internet over Wi-Fi
+
+This project turns an **ESP32-C3** paired with a **Vishay TFBS4711** infrared transceiver into an **IrDA adapter** for vintage IrDA devices like the **Palm IIIx**. One firmware does two jobs:
+
+- **HotSync with a modern Linux computer.** The adapter shows up as a USB serial port, and `pilot-link` / `jpilot` talk to the Palm through it as if it sat in a serial cradle.
+- **Internet access for the Palm.** The adapter answers the Palm's network connection itself and routes it onto Wi-Fi. The Wi-Fi network is chosen from a small web portal opened on the Palm.
+
+```
+                                                     +---------------+      USB CDC ACM      +------------------+
+                                                     |               | <===================> |   Linux Host     |
++----------------+        IrDA SIR (IR Light)        | ESP32-C3 with |    (/dev/ttyACM0)     | (pilot-xfer,     |
+|   Palm IIIx    | <===============================> |   TFBS4711    |                       |     jpilot)      |
+| (HotSync or    |      9600 - 57600 baud            |  Transceiver  |         Wi-Fi         +------------------+
+|  Network / PPP)|   (IrLAP / IrLMP / IrCOMM)        |               | <===================>     Internet
++----------------+                                   +---------------+
+```
+
+---
+
+## Why This Project is Needed
+
+Modern Linux kernels (starting with kernel 4.17 in 2018) completely removed the kernel IrDA subsystem (`irda.ko`, `ircomm`, `irattach`). Legacy USB-IrDA dongles (like KingSun or ACTiSYS) no longer work out of the box because there is no driver to handle the IrLAP/IrLMP/IrCOMM layers.
+
+**This project solves that entirely in firmware:**
+1. The **ESP32-C3** handles the IrDA protocol stack on-chip:
+   - **IrPHY**: 3/16th bit-time SIR optical pulse encoding/decoding via hardware UART.
+   - **IrLAP**: Device discovery (`XID`), link connection (`SNRM`), parameter negotiation, acknowledgment and retransmission.
+   - **IrLMP / IAS**: Information Access Service responding to queries for `"IrDA:IrCOMM"`.
+   - **TinyTP & IrCOMM**: Emulates a serial port over IR, with credit-based flow control.
+2. For HotSync, the ESP32-C3 enumerates as a native USB CDC ACM serial device (`/dev/ttyACM0` or `/dev/palm-irda`) on Linux. To `pilot-link` (`pilot-xfer`) or `jpilot`, the Palm looks like a standard wired serial Palm.
+3. For networking, the ESP32-C3 terminates the Palm's PPP session and forwards its traffic to Wi-Fi with NAT, so no computer is needed at all.
+
+---
+
+## What You Need
+
+**Parts**
+- ESP32-C3 SuperMini board (other ESP32-C3 boards work with different pin numbers in `include/config.h`).
+- Vishay TFBS4711 IrDA transceiver.
+- 100 nF ceramic capacitor (recommended, close to the transceiver).
+- For the stronger emitter supply (Option B below): one 15 Ω resistor and one 4.7 µF - 10 µF capacitor.
+- USB-C cable.
+
+**Software**
+- [PlatformIO Core (CLI)](https://platformio.org/install/cli) or VS Code with the PlatformIO IDE extension, to build and flash.
+- For HotSync: a Linux computer with `pilot-link` (`sudo apt-get install pilot-link`) or `jpilot`.
+
+**On the Palm**
+- The connection type **"IR to a PC/Handheld"** must be available (Palm OS 3.3 and later include it).
+- For Internet access: a browser or other network application that connects directly over TCP/IP.
+
+---
+
+## Hardware Wiring
+
+### ESP32-C3 SuperMini Pinout & Connections
+
+The **ESP32-C3 SuperMini** board layout makes connecting the TFBS4711 very simple, as GPIO 5, 6, and 7 are adjacent on the right header:
+
+```
+                  ESP32-C3 SuperMini Pinout
+                       +-----------+
+                       |  [USB-C]  |
+             5V   --- [|           |] ---  GPIO 5  -------> TFBS4711 Pin 4 (SD)
+            GND   --- [|           |] ---  GPIO 6  -------> TFBS4711 Pin 2 (TXD)
+            3V3   --- [|           |] ---  GPIO 7  <------- TFBS4711 Pin 3 (RXD)
+         GPIO 0   --- [|           |] ---  GPIO 8  (Onboard Blue LED, Active Low)
+         GPIO 1   --- [|           |] ---  GPIO 9  (Boot Button)
+         GPIO 2   --- [|           |] ---  GPIO 10
+         GPIO 3   --- [|           |] ---  GPIO 20
+         GPIO 4   --- [|           |] ---  GPIO 21
+                       +-----------+
+```
+
+### Vishay TFBS4711 Pinout
+
+| Pin | Name | Description | Connection |
+|:---:|:----:|:------------|:-----------|
+| **1** | **VCC2 / IRED Anode** | IR Emitter Power | **3V3** directly (Option A), or **5V** through a 15 Ω resistor (Option B). **Do NOT connect to 5V without a resistor!** |
+| **2** | **TXD** | Transmitter Data Input | **GPIO 6** (Active HIGH optical pulse input) |
+| **3** | **RXD** | Receiver Data Output | **GPIO 7** (Uses ESP32 internal pull-up, no external resistor required) |
+| **4** | **SD** | Shutdown (Active HIGH) | **GPIO 5** (Firmware drives LOW to activate transceiver) |
+| **5** | **VCC1** | Logic Supply (2.4V - 3.6V) | **3V3** |
+| **6** | **GND** | Ground | **GND** |
+
+### Option A: Minimal Wiring (no external parts)
+
+Six wires and nothing else: both supply pins of the transceiver go to 3V3.
+
+```
+                 +-----------------------------+
+                 |     ESP32-C3 SuperMini      |
+                 |                             |
+                 |      GPIO 5 (Right Pin 1)   |--------> SD   (Pin 4)
+                 |      GPIO 6 (Right Pin 2)   |--------> TXD  (Pin 2)
+                 |      GPIO 7 (Right Pin 3)   |<-------- RXD  (Pin 3)
+                 |                             |
+                 |         3V3 (Left Pin 3)    |---+----> VCC1 (Pin 5)
+                 |                             |   +----> VCC2 / IRED Anode (Pin 1)
+                 |                             |
+                 |         GND (Left Pin 2)    |--------> GND  (Pin 6)
+                 +-----------------------------+
+```
+
+### Option B: Separate Emitter Supply (recommended with Wi-Fi)
+
+The IR emitter draws short, high current pulses. Feeding it from the 5V pin through a resistor, with a capacitor next to the transceiver, keeps those pulses off the board's small 3.3 V regulator, which also has to supply the Wi-Fi radio.
+
+```
+                 +-----------------------------+
+                 |     ESP32-C3 SuperMini      |
+                 |                             |
+                 |      GPIO 5 (Right Pin 1)   |--------> SD  (Pin 4)
+                 |      GPIO 6 (Right Pin 2)   |--------> TXD (Pin 2)
+                 |      GPIO 7 (Right Pin 3)   |<-------- RXD (Pin 3)
+                 |                             |
+                 |         3V3 (Left Pin 3)    |---+----> VCC1 (Pin 5)
+                 |                             |   |
+                 |                             |  --- 100nF Ceramic
+                 |                             |  ---
+                 |                             |   |
+                 |         GND (Left Pin 2)    |---+----> GND  (Pin 6)
+                 +-----------------------------+   |
+                                                   |
+                     5V (Left Pin 1)               |
+                          |                        |
+                        [ 15 Ohm ]                 |
+                          |                        |
+                          +------------------------+----> VCC2 / IRED Anode (Pin 1)
+                          |                        |
+                        ===== 4.7uF - 10uF         |
+                          |                        |
+                         GND                      GND
+```
+
+---
+
+## Building and Flashing
+
+### 1. Build the Firmware
+```bash
+pio run
+```
+The first build downloads ESP-IDF and compiles it from source (see `sdkconfig.defaults`), which takes a few minutes; the Wi-Fi gateway needs PPP and NAT support that the prebuilt Arduino SDK does not include. Later builds are fast.
+
+### 2. Flash to ESP32-C3
+Connect the ESP32-C3 to your computer via USB:
+```bash
+pio run -t upload
+```
+If the upload cannot reach the board, hold the **BOOT** button while plugging in the USB cable and try again.
+
+After flashing, the blue LED blinks slowly: the adapter is waiting for the Palm.
+
+---
+
+## Linux Host Setup (for HotSync)
+
+### 1. Configure udev Rules
+By default, Linux's `ModemManager` attempts to probe newly attached `/dev/ttyACM*` serial devices with AT commands. This will corrupt the Palm HotSync handshake.
+
+Install the provided udev rule to disable ModemManager probing and create a convenient `/dev/palm-irda` symlink:
+
+```bash
+sudo cp udev/99-esp32-irda.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Ensure your user is part of the `dialout` group:
+```bash
+sudo usermod -aG dialout $USER
+```
+*(Log out and back in if you were not already in the dialout group).*
+
+### 2. Verify Connection
+Plug in the ESP32-C3 and check `dmesg`:
+```bash
+dmesg | tail -n 20
+```
+You should see:
+```text
+usb 1-1: new full-speed USB device number ... using xhci_hcd
+cdc_acm 1-1:1.0: ttyACM0: USB ACM device
+```
+And `/dev/palm-irda` should point to the device:
+```bash
+ls -l /dev/palm-irda
+```
+Without the udev rule, use `/dev/ttyACM0` in the commands below.
+
+---
+
+## Performing a HotSync with Palm IIIx
+
+### 1. Configure the Palm IIIx
+1. On your Palm IIIx, open the **HotSync** app from the launcher.
+2. Tap the connection dropdown below the HotSync icon (default is usually "Cradle / Cable").
+3. Select **"IR to a PC/Handheld"**.
+
+### 2. Start pilot-link on Linux
+Start the command first; it waits for the Palm:
+```bash
+pilot-xfer -p /dev/palm-irda -b ./palm_backup
+```
+`pilot-xfer` will display:
+```text
+Listening for incoming connection on /dev/palm-irda...
+```
+
+### 3. Initiate HotSync
+1. Align the Palm IIIx infrared port with the TFBS4711 transceiver (distance between 10 cm and 30 cm).
+2. Tap the **HotSync icon** on the Palm screen.
+3. The Palm and ESP32-C3 will discover each other (`XID`), connect (`SNRM` / `UA`), negotiate IrCOMM, and begin transferring databases.
+4. The onboard LED on the ESP32-C3 will turn solid ON and flicker during active data transfer.
+
+### Other Useful Commands
+Each one is started the same way: run the command, then tap HotSync on the Palm.
+
+| Task | Command |
+|:-----|:--------|
+| Back up everything | `pilot-xfer -p /dev/palm-irda -b ./palm_backup` |
+| Install an application or database | `pilot-xfer -p /dev/palm-irda -i game.prc` |
+| List what is on the Palm | `pilot-xfer -p /dev/palm-irda -l` |
+| Restore a backup | `pilot-xfer -p /dev/palm-irda -r ./palm_backup` |
+
+---
+
+## Internet for the Palm over Wi-Fi
+
+The same firmware also works as a small router: when the Palm opens a network connection over IR, the ESP32-C3 answers the PPP session itself and passes the Palm's traffic onto Wi-Fi (NAT). No Linux host is involved; the adapter only needs USB power. HotSync keeps working unchanged, because the firmware looks at the first byte the Palm sends on each connection (PPP starts with `0x7E`) and routes the session to Wi-Fi or to USB accordingly.
+
+> [!NOTE]
+> HotSync (backup and install), the PPP connection, the portal and joining a Wi-Fi network have been used with a real Palm IIIx running the Xiino browser. The web proxy is newer and has so far only been checked in host-side tests, not on hardware.
+
+### 1. Configure the Palm
+In **Prefs → Network**:
+- **Connection:** "IR to a PC/Handheld".
+- **User Name:** anything; **Phone:** leave empty; no login script.
+- **Details:** Connection type PPP, IP Address automatic, Query DNS on.
+
+Tap **Connect** with the IR ports aligned. The Palm gets the address `192.168.99.2`, the adapter is `192.168.99.1`.
+
+### 2. Choose the Wi-Fi network from the Palm
+Open **`http://wifi.setup/`** (or `http://192.168.99.1/`) in a browser on the Palm. The portal shows the Wi-Fi status and lets you scan for networks, pick one and enter its password. The pages are a few hundred bytes of plain HTML, or WML for browsers that ask for it.
+
+Up to five networks are remembered on the ESP32. Whenever it is not connected it scans and joins whichever saved network is in range, strongest first, so the adapter can move between home, office and a phone hotspot without being set up again.
+
+Only 2.4 GHz networks can be used (the ESP32-C3 has no 5 GHz radio), so a 5 GHz-only network never appears in the list. The list shows each network's security: open, WPA, WPA2 and WPA3 personal networks work; enterprise logins do not.
+
+Each saved network on the status page is a link to its details: the outcome of the last attempt, the stored password in plain text (to spot a Graffiti slip; the portal is reachable from the Palm only), a field to enter the password again, and "Forget this network".
+
+The status page shows what the adapter is doing ("looking for saved networks", "connecting to X (try 1 of 2)", "not connected, trying again in 15 s") and, for each saved network, how the last attempt ended:
+
+| Shown next to a saved network | Meaning |
+|:------------------------------|:--------|
+| connected | In use now |
+| refused, wrong password? (code N) | The access point did not complete the handshake: check the stored password on the network's details page. Codes 15 and 204 are handshake timeouts, 202 is an authentication failure |
+| not found (code 201) / not in range | The network was not seen |
+| no answer | The access point did not respond in time; usually a weak signal |
+| failed (code N) | Any other reason code reported by the Wi-Fi driver |
+
+Each network gets two tries, the second at reduced transmit power, because many ESP32-C3 SuperMini boards cannot complete the handshake at full power.
+
+- The portal is only reachable from the Palm, never from the Wi-Fi side.
+- The portal works before any Wi-Fi network is configured. While Wi-Fi is not connected, every address typed into the browser leads to the portal.
+- WAP browsers that need a WAP gateway (WSP on UDP port 9200) are not supported; the browser must be able to fetch `http://` URLs directly.
+- A default network can also be compiled in: define `WIFI_SSID` and `WIFI_PASSWORD` in `include/wifi_secrets.h` (ignored by git).
+
+### 3. Browse
+Once the status page shows "connected", the Palm is online. Keep the IR ports aligned while the connection is in use, and tap **Disconnect** in Prefs → Network when done.
+
+Palm-era browsers only speak plain `http://`, and almost every site today answers that with "use https". The adapter therefore has a **web proxy**, on by default:
+
+- The adapter answers every site name with its own address, so the browser's requests come to it.
+- It fetches the page over Wi-Fi, following redirects onto HTTPS, and passes the HTML to the Palm.
+- On the way it removes scripts, style sheets, pictures and comments, converts UTF-8 text to ISO-8859-1, turns `https://` links into `http://` links (so the browser can follow them), and cuts pages off after 48 KB.
+- The site's certificate is not checked. The Palm could not check it either; do not use this for anything that needs to be secure.
+
+The status page has a link to turn the proxy off. Do that for programs that are not web browsers (mail, telnet, IRC): with the proxy on they would be handed the adapter's address instead of their server's. With it off the Palm connects to servers itself through the adapter (NAT), and a browser reaches plain-`http://` sites only.
+
+Sites made for old or small browsers work best, for example `http://frogfind.com/` (search and simplified pages) or `http://68k.news/`.
+
+### Xiino
+Xiino by default sends every request to a "DataServer" (`pds.mobirus.com`) that no longer exists, which shows as "Host does not exist" for every address. **Clear the DataServer setting in Xiino's preferences**: Xiino then fetches pages directly and displays them cleanly. If it is left set, the adapter answers in the DataServer's place and browsing still works, but Xiino shows a line of stray characters at the top of every page, because it expects the DataServer's own page format.
+
+### Notes
+- "Diagnostics" on the status page lists the last names the Palm looked up and what came of each, and can show a browser's request exactly as it arrived. Useful when a browser behaves unexpectedly.
+- A name that does not exist leads to a page from the adapter explaining so, rather than to a browser error.
+- Throughput is limited by the IR link (57600 bps, about 5 KB/s).
+- If a network only ever connects on the second (reduced power) try, uncomment `WIFI_TX_POWER` in `include/config.h` to use that power from the start.
+- Wi-Fi transmit bursts and the IR emitter both load the board's small 3.3 V regulator. If the board resets while transferring, wire the emitter as in Option B and lower `WIFI_TX_POWER`.
+- Set `ENABLE_WIFI_GATEWAY` to `0` in `include/config.h` to switch Wi-Fi off; PPP is then passed to USB like any serial data (for `pppd` on the Linux host).
+
+---
+
+## Status LED
+
+| LED | Meaning |
+|:----|:--------|
+| Slow blink (once per second) | Idle, waiting for the Palm |
+| Solid on | IR link to the Palm is established |
+| Flicker | Frames or data are being transferred |
+
+---
+
+## Configuration
+
+All settings are in `include/config.h`.
+
+| Setting | Default | Purpose |
+|:--------|:--------|:--------|
+| `PIN_TFBS_TX` / `PIN_TFBS_RX` / `PIN_TFBS_SD` | 6 / 7 / 5 | GPIOs wired to the transceiver |
+| `PIN_STATUS_LED` | 8 | Status LED (`-1` for none); `LED_ON` / `LED_OFF` set its polarity |
+| `IRDA_TARGET_BAUD` | 57600 | Highest IR speed to negotiate with the Palm |
+| `IRDA_DEVICE_NAME` | `ESP32-IrCOMM` | Name the Palm sees during discovery |
+| `ENABLE_WIFI_GATEWAY` | 1 | Wi-Fi Internet gateway and portal on / off |
+| `PORTAL_DOMAIN` | `wifi.setup` | Name of the settings portal |
+| `WIFI_SSID` / `WIFI_PASSWORD` | empty | Default Wi-Fi network until one is chosen in the portal |
+| `WIFI_TX_POWER` | not set | Reduced Wi-Fi transmit power for boards that need it |
+| `PROXY_ALL_SITES_DEFAULT` | 1 | Web proxy on or off until changed in the portal |
+| `PROXY_MAX_PAGE_BYTES` | 48000 | Longer pages are cut off |
+| `XIINO_DATASERVER_HOST` | `pds.mobirus.com` | Name under which the adapter stands in for Xiino's DataServer |
+| `PPP_GATEWAY_IP` / `PPP_PALM_IP` | `192.168.99.1` / `.2` | Addresses on the link between adapter and Palm |
+| `ENABLE_CDC_DEBUG` | 0 | Print a protocol trace on USB instead of serial data |
+| `CURRENT_OP_MODE` | `MODE_IRCOMM` | `MODE_RAW_SIR` turns the adapter into a plain IR pulse bridge without the IrDA stack |
+
+---
+
+## Troubleshooting
+
+- **No optical response / Discovery fails:**
+  - Verify that TFBS4711 Pin 4 (SD) is at 0V (GND/LOW). When SD is HIGH (3.3V), the transceiver is in shutdown.
+  - Verify TXD (Pin 2) is connected to GPIO 6 and RXD (Pin 3) is connected to GPIO 7.
+  - Check distance and optical alignment: IrDA is directional (typically $\pm 15^\circ$ cone). Keep the Palm and transceiver within 10 to 40 cm.
+- **Connection starts then drops:**
+  - Avoid bright ambient infrared interference (direct sunlight, incandescent desk lamps, or halogen bulbs directly over the optical transceiver).
+  - Wire the emitter as in Option B: the $4.7\ \mu\text{F} - 10\ \mu\text{F}$ capacitor on Pin 1 (IRED Anode) prevents voltage dips.
+- **Seeing what the Palm and the adapter say to each other:**
+  - Set `ENABLE_CDC_DEBUG` to `1` in `include/config.h`, flash, run `pio device monitor` and tap HotSync (or Connect) on the Palm. Do not start `pilot-xfer`; the trace takes over the serial port.
+  - Every IrLAP frame is printed in hex: `RX` from the Palm, `TX` from the adapter, `RX bad FCS` for corrupted frames. Wi-Fi and PPP state changes are printed as well.
+  - Only `RX ff 3f ...` lines (discovery) repeating, with a `TX fe bf ...` after each first one but never an `RX ff 93 ...` (SNRM): the Palm does not hear the adapter, so check the TXD wiring and the IRED supply.
+  - `LAP connected` followed by `IrCOMM connected`: the link is up, set the flag back to `0` and run `pilot-xfer`.
+- **Pilot-link reports "Connection refused" or garbage bytes:**
+  - Verify ModemManager is not interfering (`sudo systemctl stop ModemManager` to test).
+  - Ensure `ENABLE_CDC_DEBUG` is set to `0` in `include/config.h` so debug strings don't mix into the binary data stream.
+- **The Palm connects to the network but no page loads:**
+  - Open `http://192.168.99.1/` first. If the portal appears, the IR and PPP side is fine; check the Wi-Fi line on the status page, then "Diagnostics" for the name lookups.
+  - "Host does not exist" for every address in Xiino: see the Xiino section above.
+  - "Cannot Open Page" from the adapter names the reason (could not connect, no answer, too many redirects).
+  - If the portal does not appear either, the browser may need a WAP gateway; try one that fetches `http://` URLs directly.
+
+---
+
+## Project Structure
+
+```
+irda-esp32/
+├── platformio.ini         # PlatformIO environment (Arduino on top of ESP-IDF, native USB CDC)
+├── sdkconfig.defaults     # ESP-IDF options: PPP, IP forwarding, NAT, quiet USB port
+├── partitions.csv         # Flash layout (3 MB application, settings storage)
+├── CMakeLists.txt         # ESP-IDF project file used by the PlatformIO build
+├── include/
+│   ├── config.h           # Pin assignments, baud rates, Wi-Fi gateway and debug settings
+│   ├── ringbuffer.h       # Circular FIFO for serial stream bridging
+│   ├── irphy.h            # Physical layer (ESP32-C3 UART1 IrDA driver)
+│   ├── irlap.h            # IrLAP link protocol (framing, CRC16 FCS, discovery)
+│   ├── irlmp.h            # IrLMP multiplexer and IAS responder
+│   ├── irttp.h            # Tiny Transport Protocol
+│   ├── ircomm.h           # IrCOMM serial stream emulation
+│   ├── irppp.h            # PPP session towards the Palm, routed onto Wi-Fi
+│   ├── irportal.h         # Wi-Fi settings portal
+│   └── irdebug.h          # Protocol trace
+├── src/
+│   ├── irphy.cpp          # Hardware UART IrDA direction switching and turn-around
+│   ├── irlap.cpp          # Framing, CRC calculation, acknowledgment and retransmission
+│   ├── irlmp.cpp          # Information Access Service queries (IrDA:IrCOMM)
+│   ├── ircomm.cpp         # Serial payload wrapping/unwrapping, TinyTP flow control
+│   ├── irppp.cpp          # PPP over IrCOMM, NAT onto the Wi-Fi interface
+│   ├── irportal.cpp       # Wi-Fi manager, web portal (HTML / WML), web proxy and DNS for the Palm
+│   ├── irdebug.cpp        # Protocol trace buffer
+│   └── main.cpp           # IrLAP state machine; routes each session to USB or Wi-Fi
+└── udev/
+    └── 99-esp32-irda.rules# Linux udev rules (disables ModemManager probing)
+```
