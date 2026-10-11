@@ -1,0 +1,9 @@
+{
+ "ok": true,
+ "ended": 0,
+ "sync_log": [
+  "Mail: 2 sent, 0 received. IMAP login: [AUTHENTICATIONFAILED] Invalid credentials (Failure)\n"
+ ],
+ "tickles": 0,
+ "records": []
+}

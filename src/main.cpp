@@ -7,6 +7,7 @@
 #include "ringbuffer.h"
 #include "irdebug.h"
 #include "irppp.h"
+#include "irmail.h"
 
 // Ring Buffers for Bidirectional Serial Bridging
 static RingBuffer<USB_TO_IR_BUF_SIZE> s_usb_to_ir_fifo;
@@ -22,14 +23,27 @@ static uint8_t s_op_mode = CURRENT_OP_MODE;
 enum SessionType {
     SESSION_UNKNOWN, // Nothing received yet
     SESSION_SERIAL,  // HotSync or other serial data, bridged to USB CDC
-    SESSION_PPP      // Network connection, served by the Wi-Fi gateway
+    SESSION_PPP,     // Network connection, served by the Wi-Fi gateway
+    SESSION_MAIL     // HotSync that no desktop answered, served by the mail conduit
 };
 static SessionType s_session = SESSION_UNKNOWN;
+
+// A serial session goes to the USB host first. If it is a HotSync and the host
+// never answers, the mail conduit gets the session; it then starts from a copy
+// of what was already passed to USB (the Palm's HotSync wake-up packet).
+static uint8_t s_opening[64];
+static size_t s_opening_len = 0;
+static uint32_t s_serial_since_ms = 0;
+static bool s_serial_is_hotsync = false;
+static bool s_host_answered = false;
 
 static void end_session() {
     if (s_session == SESSION_PPP) {
         irppp_stop();
         irdbg_printf("PPP session ended");
+    } else if (s_session == SESSION_MAIL) {
+        irmail_stop();
+        irdbg_printf("Mail session ended");
     }
     s_session = SESSION_UNKNOWN;
 }
@@ -436,12 +450,14 @@ static void process_irlap_protocol() {
 // ------------------------------------------------------------------------------
 
 static void queue_data_for_palm() {
-    if (s_session == SESSION_PPP) {
-        // Replies from the network stack; the USB host takes no part in this session
+    if (s_session == SESSION_PPP || s_session == SESSION_MAIL) {
+        // Replies from the network stack or the mail conduit; the USB host takes
+        // no part in this session
         uint8_t chunk[128];
         size_t space;
         while ((space = s_usb_to_ir_fifo.space()) > 0) {
-            size_t n = irppp_read_output(chunk, space < sizeof(chunk) ? space : sizeof(chunk));
+            size_t want = space < sizeof(chunk) ? space : sizeof(chunk);
+            size_t n = (s_session == SESSION_PPP) ? irppp_read_output(chunk, want) : irmail_read_output(chunk, want);
             if (n == 0) {
                 break;
             }
@@ -457,7 +473,34 @@ static void queue_data_for_palm() {
     while (Serial.available() > 0 && !s_usb_to_ir_fifo.is_full()) {
         s_usb_to_ir_fifo.push((uint8_t)Serial.read());
         s_last_activity_time = millis();
+        s_host_answered = true;
     }
+}
+
+// A HotSync (first byte 0xBE) that the USB host leaves unanswered is taken
+// over by the mail conduit, if mail is set up
+static void hand_over_to_mail() {
+    if (s_session != SESSION_SERIAL || !s_serial_is_hotsync || s_host_answered ||
+        millis() - s_serial_since_ms < MAIL_PC_ANSWER_TIMEOUT_MS || !irmail_ready()) {
+        return;
+    }
+    // Bytes still waiting for USB follow through route_palm_data()
+    if (irmail_start(s_opening, s_opening_len)) {
+        s_session = SESSION_MAIL;
+        s_usb_to_ir_fifo.clear();
+        irdbg_printf("No desktop answered the HotSync: mail session started");
+    }
+}
+
+// Keeps the start of a serial session for as long as the USB host is silent
+static void note_opening(const uint8_t *data, size_t len) {
+    if (s_host_answered) {
+        return;
+    }
+    size_t room = sizeof(s_opening) - s_opening_len;
+    size_t keep = len < room ? len : room;
+    memcpy(s_opening + s_opening_len, data, keep);
+    s_opening_len += keep;
 }
 
 static void route_palm_data() {
@@ -474,6 +517,10 @@ static void route_palm_data() {
             irdbg_printf("PPP session started by Palm");
         } else {
             s_session = SESSION_SERIAL;
+            s_serial_since_ms = millis();
+            s_serial_is_hotsync = s_ir_to_usb_fifo.peek() == 0xBE;
+            s_opening_len = 0;
+            s_host_answered = false;
         }
     }
 
@@ -487,16 +534,33 @@ static void route_palm_data() {
         return;
     }
 
+    if (s_session == SESSION_MAIL) {
+        // Only what the conduit has room for: bytes left in the FIFO hold back
+        // TinyTP credits, pausing the Palm
+        uint8_t chunk[256];
+        size_t room;
+        while (!s_ir_to_usb_fifo.is_empty() && (room = irmail_input_space()) > 0) {
+            size_t n = s_ir_to_usb_fifo.read(chunk, room < sizeof(chunk) ? room : sizeof(chunk));
+            irmail_input(chunk, n);
+            s_last_activity_time = millis();
+        }
+        return;
+    }
+
     // Push IrCOMM RX bytes out to Linux USB CDC. Only write what the CDC
     // driver can take right now: blocking here would break IrDA timing.
     // Bytes left in the FIFO hold back TinyTP credits, pausing the Palm.
+    uint8_t chunk[64];
 #if ENABLE_CDC_DEBUG
-    s_ir_to_usb_fifo.clear(); // The frame trace owns the CDC port
+    // The frame trace owns the CDC port: the bytes are only noted
+    while (!s_ir_to_usb_fifo.is_empty()) {
+        note_opening(chunk, s_ir_to_usb_fifo.read(chunk, sizeof(chunk)));
+    }
 #else
     int cdc_room;
     while (!s_ir_to_usb_fifo.is_empty() && (cdc_room = Serial.availableForWrite()) > 0) {
-        uint8_t chunk[64];
         size_t n = s_ir_to_usb_fifo.read(chunk, cdc_room < (int)sizeof(chunk) ? cdc_room : sizeof(chunk));
+        note_opening(chunk, n);
         Serial.write(chunk, n);
         s_last_activity_time = millis();
     }
@@ -552,6 +616,9 @@ void setup() {
 
     // 5. Start Wi-Fi and the PPP gateway (no-op when WIFI_SSID is empty)
     irppp_init();
+
+    // 6. Mail conduit for HotSync sessions that no desktop answers
+    irmail_init();
 }
 
 void loop() {
@@ -566,6 +633,7 @@ void loop() {
 
         // 2. Deliver bytes received from the Palm
         route_palm_data();
+        hand_over_to_mail();
 
         // 3. Run IrDA state machine
         process_irlap_protocol();

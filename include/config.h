@@ -139,6 +139,35 @@
 #define PPP_TO_IR_BUF_SIZE    8192       // PPP bytes queued for the (slow) IR link
 
 // ==============================================================================
+// Mail (HotSync with a mail account instead of a desktop)
+// ==============================================================================
+// The Palm's Mail application only exchanges messages through HotSync. When a
+// HotSync starts and the USB host does not answer it, the adapter answers it
+// itself: it sends the Outbox through SMTP and copies new messages from an
+// IMAP inbox to the Palm. The account is entered in the portal (needs the
+// Wi-Fi gateway above); with Gmail the password is an "app password".
+#define MAIL_PC_ANSWER_TIMEOUT_MS  1500   // A desktop that is listening answers within milliseconds
+#define MAIL_ACCEPT_TIMEOUT_MS     10000  // Wait for the Palm's wake-up packet once a session is ours
+
+// Servers until others are entered in the portal ("host" or "host:port").
+// Both connections are TLS from the first byte (no STARTTLS).
+#define MAIL_DEFAULT_IMAP_SERVER   "imap.gmail.com"
+#define MAIL_DEFAULT_SMTP_SERVER   "smtp.gmail.com"
+#define MAIL_IMAP_PORT             993
+#define MAIL_SMTP_PORT             465
+#define MAIL_CONNECT_TIMEOUT_MS    12000
+
+// Per sync: only this many of the newest inbox messages are considered (older
+// unsynced ones are passed over for good), and this many Outbox messages sent
+#define MAIL_MAX_PER_SYNC          15
+#define MAIL_MAX_SEND_PER_SYNC     10
+// A message that only exists as HTML: bytes read to find its text
+#define MAIL_HTML_FETCH_MAX        96000
+
+// Time server; message dates are converted to the time shown by the Palm's clock
+#define MAIL_NTP_SERVER            "pool.ntp.org"
+
+// ==============================================================================
 // Debug Logging
 // ==============================================================================
 // Set to 1 to print a hex trace of every IrLAP frame sent / received on the

@@ -1,5 +1,6 @@
 #include "irportal.h"
 #include "irppp.h"
+#include "irmail.h"
 #include "irdebug.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -590,6 +591,34 @@ public:
         }
     }
 
+    struct Field {
+        const char *name;  // Sent back as name=value
+        const char *label;
+        String value;      // Shown in the field, to be edited
+    };
+
+    // Form with several text fields
+    void form(const String &action, const Field *fields, size_t count, const char *button) {
+        if (wml_) {
+            for (size_t i = 0; i < count; i++) {
+                out_ += String("<p>") + fields[i].label + ": <input name=\"" + fields[i].name + "\" value=\"" +
+                        escape(fields[i].value, true) + "\"/></p>\r\n";
+            }
+            out_ += String("<p><anchor>") + button + "<go href=\"" + action + "\" method=\"get\">";
+            for (size_t i = 0; i < count; i++) {
+                out_ += String("<postfield name=\"") + fields[i].name + "\" value=\"$(" + fields[i].name + ")\"/>";
+            }
+            out_ += "</go></anchor></p>\r\n";
+        } else {
+            out_ += "<FORM ACTION=\"" + action + "\" METHOD=\"GET\">\r\n";
+            for (size_t i = 0; i < count; i++) {
+                out_ += String("<P>") + fields[i].label + ": <INPUT TYPE=\"TEXT\" NAME=\"" + fields[i].name + "\" VALUE=\"" +
+                        escape(fields[i].value, false) + "\"></P>\r\n";
+            }
+            out_ += String("<P><INPUT TYPE=\"SUBMIT\" VALUE=\"") + button + "\"></P>\r\n</FORM>\r\n";
+        }
+    }
+
     void send() {
         out_ += wml_ ? "</card></wml>\r\n" : "</BODY>\r\n</HTML>\r\n";
         respond("200 OK", wml_ ? "text/vnd.wap.wml" : "text/html", out_);
@@ -653,6 +682,10 @@ static void handle_status() {
         page.line("Web proxy: off. The Palm connects to sites itself: plain http only, but other programs (mail, telnet) work.");
         page.link("/proxy/1", "Turn web proxy on");
     }
+
+    const IrMailSettings &mail = irmail_settings();
+    page.link("/mail", mail.address.length() == 0 ? String("Mail: not set up")
+                                                  : String(irmail_ready() ? "Mail: on, " : "Mail: off, ") + mail.address);
 
     page.link("/", "Refresh");
     page.link("/nets", "Add Wi-Fi network");
@@ -837,6 +870,138 @@ static void handle_forget(int index) {
     store_saved_networks();
     restart_wifi_manager();
     page.link("/", "Back");
+    page.send();
+}
+
+// ------------------------------------------------------------------------------
+// Mail Pages
+// ------------------------------------------------------------------------------
+// Settings of the mail conduit (irmail). A HotSync cannot run while these pages
+// are open: the browser and HotSync need the same infrared link.
+
+static void handle_mail() {
+    Page page("Mail");
+    const IrMailSettings &mail = irmail_settings();
+
+    if (mail.address.length() == 0) {
+        page.line("No mail account entered yet.");
+    } else {
+        page.line("Account: " + mail.address);
+        page.line(mail.password.length() > 0 ? "Password: " + String((unsigned)mail.password.length()) + " characters stored"
+                                            : String("Password: none stored"));
+    }
+    page.link("/mailacct", mail.address.length() == 0 ? "Enter the account" : "Change the account");
+
+    if (irmail_ready()) {
+        page.line("Mail sync: on. Tap HotSync on the Palm while no desktop program is waiting for it: "
+                  "the Outbox is sent and new messages arrive in the Inbox.");
+        page.link("/mailon/0", "Turn mail sync off");
+    } else if (mail.address.length() > 0 && mail.password.length() > 0) {
+        page.line("Mail sync: off.");
+        page.link("/mailon/1", "Turn mail sync on");
+    }
+    String last = irmail_last_result();
+    if (last.length() > 0) {
+        page.line("Last sync: " + last);
+    }
+
+    page.link("/mailtest", "Check the login now");
+    page.link("/mailsrv", "Servers: " + mail.imap_host + ", " + mail.smtp_host);
+    page.link(mail.cyrillic ? "/mailtext/0" : "/mailtext/1",
+              mail.cyrillic ? "Text: Cyrillic (Windows-1251). Switch to Western" : "Text: Western. Switch to Cyrillic");
+    page.link("/mailagain", "Fetch the newest messages again");
+    page.link("/", "Back");
+    page.send();
+}
+
+static void handle_mail_account() {
+    Page page("Mail Account");
+    const IrMailSettings &mail = irmail_settings();
+
+    page.line("With Gmail the password is an app password: Google account, Security, 2-Step Verification, App passwords.");
+    if (mail.password.length() > 0) {
+        page.line("Leave the password empty to keep the stored one.");
+    }
+    const Page::Field fields[] = {{"a", "E-mail address", mail.address}, {"p", "Password", ""}, {"n", "Your name", mail.name}};
+    page.form("/mailsave", fields, 3, "Save");
+    page.link("/mail", "Back");
+    page.send();
+}
+
+static void handle_mail_account_save() {
+    Page page("Mail Account");
+    IrMailSettings mail = irmail_settings();
+
+    String address = request_arg("a");
+    String password = request_arg("p");
+    address.trim();
+    if (address.indexOf('@') < 1 || address.indexOf(' ') >= 0) {
+        page.line("'" + address + "' is not an e-mail address. The browser asked for: " + s_target);
+        page.link("/mailacct", "Back");
+        page.send();
+        return;
+    }
+    mail.address = address;
+    if (password.length() > 0) {
+        mail.password = password;
+    }
+    mail.name = request_arg("n");
+    mail.name.trim();
+    mail.enabled = mail.password.length() > 0;
+    irmail_store_settings(mail);
+
+    // Graffiti slips are easy: show how much was understood
+    page.line("Saved " + mail.address + " (password: " + String((unsigned)mail.password.length()) + " characters).");
+    page.line(mail.enabled ? "Mail sync is on." : "Mail sync stays off until a password is entered.");
+    page.link("/mailtest", "Check the login now");
+    page.link("/mail", "Back");
+    page.send();
+}
+
+static void handle_mail_servers(bool save) {
+    Page page("Mail Servers");
+    IrMailSettings mail = irmail_settings();
+
+    if (save) {
+        mail.imap_host = request_arg("i");
+        mail.smtp_host = request_arg("s");
+        mail.login = request_arg("l");
+        mail.imap_host.trim();
+        mail.smtp_host.trim();
+        mail.login.trim();
+        if (mail.imap_host.length() == 0) {
+            mail.imap_host = MAIL_DEFAULT_IMAP_SERVER;
+        }
+        if (mail.smtp_host.length() == 0) {
+            mail.smtp_host = MAIL_DEFAULT_SMTP_SERVER;
+        }
+        irmail_store_settings(mail);
+        page.line("Saved.");
+    }
+    page.line("Both servers are contacted with TLS, on ports " + String(MAIL_IMAP_PORT) + " and " + String(MAIL_SMTP_PORT) +
+              " unless another is given as server:port.");
+    const Page::Field fields[] = {{"i", "Receiving (IMAP)", mail.imap_host},
+                                  {"s", "Sending (SMTP)", mail.smtp_host},
+                                  {"l", "Login name, if not the address", mail.login}};
+    page.form("/mailsrvsave", fields, 3, "Save");
+    page.link("/mail", "Back");
+    page.send();
+}
+
+// Logs in to both servers; the browser waits for the result
+static void handle_mail_test() {
+    Page page("Mail Login");
+    const IrMailSettings &mail = irmail_settings();
+
+    if (mail.address.length() == 0 || mail.password.length() == 0) {
+        page.line("Enter the account first.");
+    } else {
+        String receiving, sending;
+        irmail_check_login(receiving, sending);
+        page.line("Receiving (" + mail.imap_host + "): " + receiving);
+        page.line("Sending (" + mail.smtp_host + "): " + sending);
+    }
+    page.link("/mail", "Back");
     page.send();
 }
 
@@ -1372,6 +1537,26 @@ static void route_request() {
         s_proxy_all_sites = (index == 1);
         store_settings();
         handle_status();
+    }
+    else if (path == "/mail" && !indexed) handle_mail();
+    else if (path == "/mailacct") handle_mail_account();
+    else if (path == "/mailsave") handle_mail_account_save();
+    else if (path == "/mailsrv") handle_mail_servers(false);
+    else if (path == "/mailsrvsave") handle_mail_servers(true);
+    else if (path == "/mailtest") handle_mail_test();
+    else if ((path == "/mailon" || path == "/mailtext") && indexed && index >= 0 && index <= 1) {
+        IrMailSettings mail = irmail_settings();
+        if (path == "/mailon") {
+            mail.enabled = (index == 1);
+        } else {
+            mail.cyrillic = (index == 1);
+        }
+        irmail_store_settings(mail);
+        handle_mail();
+    }
+    else if (path == "/mailagain") {
+        irmail_forget_position();
+        handle_mail();
     }
     else if (path == "/net" && saved) handle_saved_network(index);
     else if (path == "/pass" && saved) handle_change_password(index);

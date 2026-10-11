@@ -1,9 +1,10 @@
-# ESP32-C3 IrDA Adapter for the Palm IIIx: HotSync over USB and Internet over Wi-Fi
+# ESP32-C3 IrDA Adapter for the Palm IIIx: HotSync over USB, Internet and Mail over Wi-Fi
 
-This project turns an **ESP32-C3** paired with a **Vishay TFBS4711** infrared transceiver into an **IrDA adapter** for vintage IrDA devices like the **Palm IIIx**. One firmware does two jobs:
+This project turns an **ESP32-C3** paired with a **Vishay TFBS4711** infrared transceiver into an **IrDA adapter** for vintage IrDA devices like the **Palm IIIx**. One firmware does three jobs:
 
 - **HotSync with a modern Linux computer.** The adapter shows up as a USB serial port, and `pilot-link` / `jpilot` talk to the Palm through it as if it sat in a serial cradle.
 - **Internet access for the Palm.** The adapter answers the Palm's network connection itself and routes it onto Wi-Fi. The Wi-Fi network is chosen from a small web portal opened on the Palm.
+- **E-mail in the Palm's Mail application.** When a HotSync finds no computer, the adapter performs it itself and exchanges the Mail application's messages with a mail account (IMAP / SMTP, for example Gmail) over Wi-Fi.
 
 ```
                                                      +---------------+      USB CDC ACM      +------------------+
@@ -29,6 +30,7 @@ Modern Linux kernels (starting with kernel 4.17 in 2018) completely removed the 
    - **TinyTP & IrCOMM**: Emulates a serial port over IR, with credit-based flow control.
 2. For HotSync, the ESP32-C3 enumerates as a native USB CDC ACM serial device (`/dev/ttyACM0` or `/dev/palm-irda`) on Linux. To `pilot-link` (`pilot-xfer`) or `jpilot`, the Palm looks like a standard wired serial Palm.
 3. For networking, the ESP32-C3 terminates the Palm's PPP session and forwards its traffic to Wi-Fi with NAT, so no computer is needed at all.
+4. For mail, the ESP32-C3 speaks the desktop's side of HotSync itself (SLP, PADP, CMP and DLP, the protocols `pilot-link` implements) and acts as the Mail conduit, with an IMAP and an SMTP client on the Wi-Fi side.
 
 ---
 
@@ -228,7 +230,7 @@ Each one is started the same way: run the command, then tap HotSync on the Palm.
 
 ## Internet for the Palm over Wi-Fi
 
-The same firmware also works as a small router: when the Palm opens a network connection over IR, the ESP32-C3 answers the PPP session itself and passes the Palm's traffic onto Wi-Fi (NAT). No Linux host is involved; the adapter only needs USB power. HotSync keeps working unchanged, because the firmware looks at the first byte the Palm sends on each connection (PPP starts with `0x7E`) and routes the session to Wi-Fi or to USB accordingly.
+The same firmware also works as a small router: when the Palm opens a network connection over IR, the ESP32-C3 answers the PPP session itself and passes the Palm's traffic onto Wi-Fi (NAT). No Linux host is involved; the adapter only needs USB power. HotSync keeps working unchanged, because the firmware looks at the first byte the Palm sends on each connection (PPP starts with `0x7E`, HotSync with `0xBE`) and routes the session to Wi-Fi or to USB accordingly.
 
 > [!NOTE]
 > HotSync (backup and install), the PPP connection, the portal and joining a Wi-Fi network have been used with a real Palm IIIx running the Xiino browser. The web proxy is newer and has so far only been checked in host-side tests, not on hardware.
@@ -294,6 +296,56 @@ Xiino by default sends every request to a "DataServer" (`pds.mobirus.com`) that 
 
 ---
 
+## Mail on the Palm
+
+The Palm's built-in **Mail** application has no network code: it only exchanges messages during a HotSync, through a "conduit" on the desktop. The adapter can be that desktop. When a HotSync starts and no program on the USB host answers it, the adapter takes the HotSync over and synchronises Mail with a mail account over Wi-Fi:
+
+- Messages in the **Outbox** are sent (SMTP) and then removed from the Palm.
+- Messages that arrived in the account's inbox since the last sync are copied to the Palm's **Inbox** (IMAP).
+
+No computer is involved; the adapter only needs USB power and a saved Wi-Fi network.
+
+> [!NOTE]
+> The mail function has so far only been checked in host-side tests: against a simulated Palm, against `pilot-link`, and against scripted mail servers (see "Host-Side Tests"). It has not yet been used with a real Palm or a real mail server.
+
+### 1. Enter the account
+Connect the Palm to the network as described above, open **`http://wifi.setup/`** and follow **Mail**:
+
+- **Enter the account:** e-mail address, password, and the name recipients should see.
+- With **Gmail** the password must be an *app password*: Google account → Security → 2-Step Verification → App passwords. Google refuses the normal account password here. It is 16 lower-case letters.
+- For **other providers**, open "Servers" and enter the IMAP and SMTP server names. Both are contacted with TLS from the first byte, on ports 993 and 465 (another port can be given as `server:port`; STARTTLS on ports 143 / 587 is not supported).
+- **Check the login now** tries both servers and shows what they answer.
+
+Then tap **Disconnect** in Prefs → Network: HotSync needs the infrared link for itself.
+
+### 2. Synchronise
+In the **HotSync** application choose "IR to a PC/Handheld" and tap the HotSync icon, exactly as for a desktop sync.
+
+- The adapter passes the HotSync to USB first. A desktop program that is waiting (`pilot-xfer`, `jpilot`) answers within milliseconds and gets the session, as before.
+- If nothing answers within 1.5 seconds, the adapter does the mail sync itself.
+
+The outcome is written to the **HotSync log** on the Palm (HotSync → Log), for example `Mail: 1 sent, 3 received`, or the reason something failed. The portal's Mail page shows the same line.
+
+### What is synchronised
+- The choice under **Options → HotSync Options** in the Mail application is respected: All, Send only, Filter, Unread, and the Truncate length.
+- Only the 15 newest messages of the inbox are looked at in one sync. If more than that arrived since the last sync, the older ones are passed over for good. The first sync fetches the 15 newest.
+- Messages arrive as text. Of a message with several parts the plain text is taken; a message that only exists as HTML is reduced to its text; attachments are left out.
+- Text is converted to the Palm's character set (Windows-1252). Accented letters it lacks become plain letters, other scripts become `?`. With a Cyrillic localisation on the Palm, switch "Text" on the Mail page to Cyrillic (Windows-1251).
+- **Nothing is changed on the server.** The mailbox is opened read-only: reading or deleting a message on the Palm does not mark or delete it in the account. A message already read elsewhere arrives marked as read.
+- A sent message leaves the Outbox once the server has accepted it. Gmail keeps its own copy under "Sent"; other providers may not.
+- Messages deleted on the Palm are purged from its memory during the sync.
+- The signature set in Mail's preferences is appended to messages that ask for it.
+- Dates are shown in the Palm's time. The adapter gets the time from the network and takes the time zone from the Palm's clock, so set that clock correctly.
+
+### Notes
+- The password is stored unencrypted in the ESP32's flash, like the Wi-Fi passwords. An app password can be revoked at any time; a mail account used only for the Palm limits the exposure further.
+- The mail servers' certificates are checked (unlike the web proxy's).
+- Keep the IR ports aligned until the Palm reports that the HotSync is complete.
+- "Fetch the newest messages again" on the Mail page makes the next sync start over, for example after emptying the Palm's Inbox.
+- To sync with a computer while mail is set up, start `pilot-xfer` / `jpilot` **before** tapping HotSync, or turn mail sync off on the Mail page.
+
+---
+
 ## Status LED
 
 | LED | Meaning |
@@ -322,6 +374,11 @@ All settings are in `include/config.h`.
 | `PROXY_MAX_PAGE_BYTES` | 48000 | Longer pages are cut off |
 | `XIINO_DATASERVER_HOST` | `pds.mobirus.com` | Name under which the adapter stands in for Xiino's DataServer |
 | `PPP_GATEWAY_IP` / `PPP_PALM_IP` | `192.168.99.1` / `.2` | Addresses on the link between adapter and Palm |
+| `MAIL_PC_ANSWER_TIMEOUT_MS` | 1500 | How long a HotSync waits for a desktop on USB before it becomes a mail sync |
+| `MAIL_DEFAULT_IMAP_SERVER` / `MAIL_DEFAULT_SMTP_SERVER` | Gmail's | Mail servers until others are entered in the portal |
+| `MAIL_MAX_PER_SYNC` / `MAIL_MAX_SEND_PER_SYNC` | 15 / 10 | Newest inbox messages looked at, and Outbox messages sent, per sync |
+| `MAIL_HTML_FETCH_MAX` | 96000 | Bytes read of a message that only exists as HTML |
+| `MAIL_NTP_SERVER` | `pool.ntp.org` | Time server (for message dates) |
 | `ENABLE_CDC_DEBUG` | 0 | Print a protocol trace on USB instead of serial data |
 | `CURRENT_OP_MODE` | `MODE_IRCOMM` | `MODE_RAW_SIR` turns the adapter into a plain IR pulse bridge without the IrDA stack |
 
@@ -350,6 +407,30 @@ All settings are in `include/config.h`.
   - "Cannot Open Page" from the adapter names the reason (could not connect, no answer, too many redirects).
   - If the portal does not appear either, the browser may need a WAP gateway; try one that fetches `http://` URLs directly.
 
+- **A HotSync meant for the computer turned into a mail sync:**
+  - The desktop program was not waiting yet. Start `pilot-xfer` (or the sync in `jpilot`) first, then tap HotSync; or turn mail sync off on the portal's Mail page.
+- **The mail sync reports a problem (HotSync log on the Palm, or the portal's Mail page):**
+  - `IMAP login: ...` / `SMTP login: ...`: the server refused the password. With Gmail it must be an app password; "Check the login now" on the Mail page tests it without a HotSync.
+  - `cannot connect to ...`: wrong server name, a server without TLS on that port, or a certificate that cannot be verified.
+  - `Wi-Fi is not connected`: check the status page of the portal.
+- **The Palm reports a HotSync connection error with mail set up:**
+  - Set `ENABLE_CDC_DEBUG` to `1` and watch the trace: lines starting with `Mail:` show each step of the sync, and the free memory at its start.
+
+---
+
+## Host-Side Tests
+
+The parts that do not need the ESP32 can be tried on a computer (needs `g++` and `python3`):
+
+```bash
+test/host/run.sh
+```
+
+- **HotSync protocols:** the firmware's code talks to a simulated Palm (`test/host/fake_palm.py`) over a pseudo terminal. The requests it sends must be byte for byte those that `pilot-link` sent to the same simulated Palm for the same steps (recorded in `test/host/data/`). The sync is repeated with every single packet lost once, in either direction.
+- **Mail text:** records of the Mail database, character sets, MIME encodings, HTML to text, headers, dates.
+- **IMAP and SMTP clients:** against scripted servers that answer as Gmail does, with the answers arriving whole and one byte at a time.
+- **Whole mail syncs:** the conduit between the simulated Palm and the scripted servers; what the Palm holds afterwards is compared with the expected contents.
+
 ---
 
 ## Project Structure
@@ -370,6 +451,11 @@ irda-esp32/
 │   ├── ircomm.h           # IrCOMM serial stream emulation
 │   ├── irppp.h            # PPP session towards the Palm, routed onto Wi-Fi
 │   ├── irportal.h         # Wi-Fi settings portal
+│   ├── irmail.h           # Mail: HotSync sessions served by the adapter itself
+│   ├── hotsync.h          # HotSync from the desktop's side (SLP, PADP, CMP, DLP)
+│   ├── mailsync.h         # The mail conduit (Outbox to SMTP, IMAP inbox to Inbox)
+│   ├── mailnet.h          # IMAP and SMTP clients
+│   ├── mailtext.h         # Mail records, character sets, MIME, headers, dates
 │   └── irdebug.h          # Protocol trace
 ├── src/
 │   ├── irphy.cpp          # Hardware UART IrDA direction switching and turn-around
@@ -378,8 +464,14 @@ irda-esp32/
 │   ├── ircomm.cpp         # Serial payload wrapping/unwrapping, TinyTP flow control
 │   ├── irppp.cpp          # PPP over IrCOMM, NAT onto the Wi-Fi interface
 │   ├── irportal.cpp       # Wi-Fi manager, web portal (HTML / WML), web proxy and DNS for the Palm
+│   ├── irmail.cpp         # Mail settings, conduit task, TLS connection to the mail servers
+│   ├── hotsync.cpp        # HotSync protocols, as pilot-link speaks them
+│   ├── mailsync.cpp       # Steps of a mail sync
+│   ├── mailnet.cpp        # IMAP and SMTP
+│   ├── mailtext.cpp       # Conversion between Mail records and Internet mail
 │   ├── irdebug.cpp        # Protocol trace buffer
-│   └── main.cpp           # IrLAP state machine; routes each session to USB or Wi-Fi
+│   └── main.cpp           # IrLAP state machine; routes each session to USB, Wi-Fi or mail
+├── test/host/             # Tests that run on a computer (see "Host-Side Tests")
 └── udev/
     └── 99-esp32-irda.rules# Linux udev rules (disables ModemManager probing)
 ```

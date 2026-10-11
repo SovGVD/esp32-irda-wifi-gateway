@@ -1,0 +1,46 @@
+{
+ "ok": true,
+ "ended": 0,
+ "sync_log": [
+  "Mail: 0 sent, 0 received, 2 not sent. Wi-Fi is not connected\n"
+ ],
+ "tickles": 0,
+ "records": [
+  {
+   "id": 10485761,
+   "attr": 0,
+   "category": 1,
+   "data": "f54b121e440048656c6c6f2066726f6d207468652050616c6d0000667269656e64406578616d706c652e636f6d00000000004669727374206c696e650a5365636f6e64206c696e6500",
+   "mail": {
+    "date": "2026-10-11 18:30",
+    "flags": "0x44",
+    "subject": "Hello from the Palm",
+    "from": "",
+    "to": "friend@example.com",
+    "cc": "",
+    "bcc": "",
+    "reply_to": "",
+    "sent_to": "",
+    "body": "First line\nSecond line"
+   }
+  },
+  {
+   "id": 10485762,
+   "attr": 0,
+   "category": 1,
+   "data": "f54b121f04005365636f6e64000061406578616d706c652e636f6d2c2062406578616d706c652e6f72670000000000426f64792074776f00",
+   "mail": {
+    "date": "2026-10-11 18:31",
+    "flags": "0x04",
+    "subject": "Second",
+    "from": "",
+    "to": "a@example.com, b@example.org",
+    "cc": "",
+    "bcc": "",
+    "reply_to": "",
+    "sent_to": "",
+    "body": "Body two"
+   }
+  }
+ ]
+}
