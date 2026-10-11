@@ -140,7 +140,7 @@ class Link:
 
 
 class Palm:
-    def __init__(self, link, log, outbox, clock):
+    def __init__(self, link, log, outbox, clock, inbox=()):
         self.link = link
         self.clock = clock  # What the handheld's clock shows
         self.log = log
@@ -155,6 +155,8 @@ class Palm:
                             (b"mail", 3): b"Sent from my Palm IIIx\x00"}
         for data in outbox:
             self.add_record(1, data)
+        for r in inbox:  # Records already on the handheld: {"id", "attr", "category", "data" (hex)}
+            self.records.append({"id": r["id"], "attr": r["attr"], "category": r["category"], "data": bytes.fromhex(r["data"])})
 
     def add_record(self, category, data):
         self.records.append({"id": self.next_id, "attr": 0x40, "category": category, "data": data})
@@ -211,14 +213,15 @@ class Palm:
             r = matching[position]
             return self.reply(command, arg=struct.pack(">IHHBB", r["id"], self.records.index(r), len(r["data"]),
                                                        r["attr"], r["category"]) + r["data"])
-        if command == 0x20:  # ReadRecord, by id
-            record_id = struct.unpack(">I", arg[2:6])[0]
-            found = [r for r in self.records if r["id"] == record_id]
+        if command == 0x20:  # ReadRecord, by id: from an offset, up to a length
+            record_id, offset, length = struct.unpack(">IHH", arg[2:10])
+            found = [r for r in self.records if r["id"] == record_id and not r["attr"] & 0x80]
             if not found:
                 return self.reply(command, ERR_NOT_FOUND)
             r = found[0]
-            return self.reply(command, arg=struct.pack(">IHHBB", r["id"], self.records.index(r), len(r["data"]),
-                                                       r["attr"], r["category"]) + r["data"])
+            data = r["data"][offset:offset + length]
+            return self.reply(command, arg=struct.pack(">IHHBB", r["id"], self.records.index(r), len(data),
+                                                       r["attr"], r["category"]) + data)
         if command == 0x21:  # WriteRecord
             record_id, attr, category = struct.unpack(">IBB", arg[2:8])
             data = arg[8:]
@@ -312,6 +315,7 @@ def main():
     parser.add_argument("--drop", type=int, action="append", default=[], help="lose our Nth packet")
     parser.add_argument("--ignore", type=int, action="append", default=[], help="lose the desktop's Nth packet")
     parser.add_argument("--outbox", action="append", default=[], help="file holding one Outbox record")
+    parser.add_argument("--inbox", help="JSON file with records already on the handheld")
     parser.add_argument("--time", help="what the handheld's clock shows (default: the computer's time)")
     args = parser.parse_args()
 
@@ -321,7 +325,8 @@ def main():
 
     with open(args.log, "w") as log:
         clock = time.strptime(args.time, "%Y-%m-%d %H:%M:%S") if args.time else None
-        palm = Palm(Link(master, args.drop, args.ignore), log, [open(name, "rb").read() for name in args.outbox], clock)
+        inbox = json.load(open(args.inbox)) if args.inbox else []
+        palm = Palm(Link(master, args.drop, args.ignore), log, [open(name, "rb").read() for name in args.outbox], clock, inbox)
         ok = palm.run()
     with open(args.state, "w") as out:
         json.dump({"ok": ok, "ended": palm.ended, "sync_log": palm.sync_log, "tickles": palm.link.tickles,

@@ -452,15 +452,23 @@ bool ImapClient::on_examine() {
     return skip_value(second) && skip_line();
 }
 
-bool ImapClient::examine_inbox(uint32_t *uid_validity, uint32_t *exists) {
+bool ImapClient::open_inbox(const char *text, uint32_t *uid_validity, uint32_t *exists) {
     uid_validity_ = 0;
     exists_ = 0;
-    if (!command("EXAMINE INBOX", &ImapClient::on_examine, "inbox")) {
+    if (!command(text, &ImapClient::on_examine, "inbox")) {
         return false;
     }
     *uid_validity = uid_validity_;
     *exists = exists_;
     return true;
+}
+
+bool ImapClient::examine_inbox(uint32_t *uid_validity, uint32_t *exists) {
+    return open_inbox("EXAMINE INBOX", uid_validity, exists);
+}
+
+bool ImapClient::select_inbox(uint32_t *uid_validity, uint32_t *exists) {
+    return open_inbox("SELECT INBOX", uid_validity, exists);
 }
 
 // "* 12 FETCH (UID 100 FLAGS (\Seen))"
@@ -518,6 +526,77 @@ bool ImapClient::list_newest(uint32_t exists, uint32_t count, std::vector<ImapMe
     list_ = &out;
     uint32_t first = (exists > count) ? exists - count + 1 : 1;
     return command("FETCH " + number(first) + ":" + number(exists) + " (UID FLAGS)", &ImapClient::on_list, "list");
+}
+
+static std::string uid_set(const std::vector<uint32_t> &uids) {
+    std::string text;
+    for (size_t i = 0; i < uids.size(); i++) {
+        text += (i > 0 ? "," : "") + number(uids[i]);
+    }
+    return text;
+}
+
+bool ImapClient::fetch_flags(const std::vector<uint32_t> &uids, std::vector<ImapMessage> &out) {
+    out.clear();
+    if (uids.empty()) {
+        return true;
+    }
+    list_ = &out;
+    return command("UID FETCH " + uid_set(uids) + " (UID FLAGS)", &ImapClient::on_list, "flags");
+}
+
+bool ImapClient::mark_read(const std::vector<uint32_t> &uids) {
+    return uids.empty() || command("UID STORE " + uid_set(uids) + " +FLAGS.SILENT (\\Seen)", nullptr, "mark read");
+}
+
+// "* LIST (\HasNoChildren \Trash) "/" "[Gmail]/Trash""
+bool ImapClient::on_folder() {
+    Token kind, token;
+    if (!next(kind) || kind.type == END_OF_LINE) {
+        return kind.type == END_OF_LINE;
+    }
+    if (kind.type != ATOM || strcasecmp(kind.text.c_str(), "LIST") != 0) {
+        return skip_value(kind) && skip_line();
+    }
+    if (!next(token) || token.type != OPEN) {
+        return false;
+    }
+    bool trash = false;
+    while (next(token) && token.type == ATOM) {
+        trash = trash || strcasecmp(token.text.c_str(), "\\Trash") == 0;
+    }
+    std::string delimiter, name;
+    if (token.type != CLOSE || !value(delimiter, 8) || !value(name, IMAP_STRING_MAX)) {
+        return false;
+    }
+    if (trash && trash_->empty()) {
+        *trash_ = name;
+    }
+    return skip_line();
+}
+
+bool ImapClient::find_trash(std::string &mailbox) {
+    mailbox.clear();
+    trash_ = &mailbox;
+    return command("LIST \"\" \"*\"", &ImapClient::on_folder, "folders");
+}
+
+bool ImapClient::remove(const std::vector<uint32_t> &uids, const std::string &trash) {
+    if (uids.empty()) {
+        return true;
+    }
+    std::string set = uid_set(uids);
+    if (!trash.empty()) {
+        if (command("UID MOVE " + set + " " + quoted(trash), nullptr, "delete")) {
+            return true;
+        }
+        // A server without MOVE: copy, then delete from the inbox
+        if (!command("UID COPY " + set + " " + quoted(trash), nullptr, "delete")) {
+            return false;
+        }
+    }
+    return command("UID STORE " + set + " +FLAGS.SILENT (\\Deleted)", nullptr, "delete") &&
+           command("EXPUNGE", nullptr, "delete");
 }
 
 // One body of a BODYSTRUCTURE, whose opening parenthesis was just read. Notes

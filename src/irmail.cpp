@@ -58,6 +58,7 @@ void irmail_forget_position() {
     prefs.begin("irmail", false);
     prefs.remove("uidv");
     prefs.remove("uid");
+    prefs.remove("links");
     prefs.end();
 }
 
@@ -380,6 +381,42 @@ public:
         prefs.begin("irmail", false);
         prefs.putULong("uidv", uid_validity);
         prefs.putULong("uid", last_uid);
+        prefs.end();
+    }
+
+    // 9 bytes per message: Palm record ID, UID, read
+    void load_links(std::vector<MailLink> &links) override {
+        links.clear();
+        Preferences prefs;
+        prefs.begin("irmail", true);
+        size_t len = prefs.isKey("links") ? prefs.getBytesLength("links") : 0;
+        std::vector<uint8_t> data(len);
+        if (len > 0 && prefs.getBytes("links", data.data(), len) == len) {
+            for (size_t at = 0; at + 9 <= len; at += 9) {
+                MailLink link;
+                memcpy(&link.record_id, &data[at], 4);
+                memcpy(&link.uid, &data[at + 4], 4);
+                link.read = data[at + 8] != 0;
+                links.push_back(link);
+            }
+        }
+        prefs.end();
+    }
+
+    void store_links(const std::vector<MailLink> &links) override {
+        std::vector<uint8_t> data(links.size() * 9);
+        for (size_t i = 0; i < links.size(); i++) {
+            memcpy(&data[i * 9], &links[i].record_id, 4);
+            memcpy(&data[i * 9 + 4], &links[i].uid, 4);
+            data[i * 9 + 8] = links[i].read ? 1 : 0;
+        }
+        Preferences prefs;
+        prefs.begin("irmail", false);
+        if (links.empty()) {
+            prefs.remove("links");
+        } else {
+            prefs.putBytes("links", data.data(), data.size());
+        }
         prefs.end();
     }
 

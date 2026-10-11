@@ -2,7 +2,7 @@
 // over a pseudo terminal, and IMAP / SMTP to scripted servers. run.sh compares
 // what the simulated Palm holds afterwards with the expected contents.
 //
-//   mailsync_test <terminal> normal|bad-imap|offline|oauth <outbox record files...>
+//   mailsync_test <terminal> normal|bad-imap|offline|oauth|changes <outbox record files...>
 #include "hotsync.h"
 #include "mailoauth.h"
 #include "mailsync.h"
@@ -71,8 +71,11 @@ public:
         last_uid_ = last_uid;
         stored_ = true;
     }
+    void load_links(std::vector<MailLink> &links) override { links = links_; }
+    void store_links(const std::vector<MailLink> &links) override { links_ = links; }
     void trace(const std::string &text) override { printf("trace: %s\n", text.c_str()); }
 
+    std::vector<MailLink> links_;
     uint32_t uid_validity_ = 1700000001;
     uint32_t last_uid_ = 205;
     bool stored_ = false;
@@ -165,6 +168,13 @@ int main(int argc, char **argv) {
     }
     smtp_steps.push_back({"QUIT\r\n", "221 2.0.0 closing connection\r\n"});
 
+    // "changes": messages copied in earlier syncs, which became read or deleted
+    // on one side (the Palm's side is in data/mailsync-changes-inbox.json)
+    bool changes = scenario == "changes";
+    std::vector<MailLink> links = {{0x00B00001, 100, false}, {0x00B00002, 101, false}, {0x00B00003, 102, false},
+                                   {0x00B00004, 103, false}, {0x00B00005, 104, false}, {0x00B00006, 105, false},
+                                   {0x00B00007, 106, false}};
+
     // --- IMAP: four messages listed, two of them new since the last sync ---
     const std::string items = " (INTERNALDATE BODYSTRUCTURE BODY.PEEK[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE X-PRIORITY IMPORTANCE)])\r\n";
     const std::string header_item = "BODY[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE X-PRIORITY IMPORTANCE)] ";
@@ -174,7 +184,7 @@ int main(int argc, char **argv) {
     } else {
         std::vector<Step> rest = {
             {imap_login, "* CAPABILITY IMAP4rev1 UNSELECT IDLE\r\nA1 OK me@gmail.com authenticated (Success)\r\n"},
-            {"A2 EXAMINE INBOX\r\n",
+            {changes ? "A2 SELECT INBOX\r\n" : "A2 EXAMINE INBOX\r\n",
              "* FLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen)\r\n* OK [PERMANENTFLAGS ()] Flags permitted.\r\n"
              "* OK [UIDVALIDITY 1700000001] UIDs valid.\r\n* 7 EXISTS\r\n* 0 RECENT\r\n* OK [UIDNEXT 213] Predicted next UID.\r\n"
              "A2 OK [READ-ONLY] INBOX selected. (Success)\r\n"},
@@ -199,9 +209,27 @@ int main(int argc, char **argv) {
              "* 7 FETCH (UID 212 BODY[1]<0> " +
              literal("PGh0bWw+PGJvZHk+PHA+SGVsbG8gPGI+UGFsbTwvYj48L3A+PHA+U2Vjb25kJm5ic3A7cGFy\r\nYWdyYXBoPC9wPjwvYm9keT48L2h0bWw+\r\n") +
              ")\r\nA7 OK Success\r\n"},
-            {"A8 LOGOUT\r\n", "* BYE\r\nA8 OK\r\n"},
         };
         imap_steps.insert(imap_steps.end(), rest.begin(), rest.end());
+        if (changes) {
+            std::vector<Step> more = {
+                // 103 was archived in Gmail, 104 was purged on the Palm
+                {"A8 UID FETCH 100,101,102,103,104,105,106 (UID FLAGS)\r\n",
+                 "* 1 FETCH (UID 100 FLAGS ())\r\n* 2 FETCH (UID 101 FLAGS ())\r\n* 3 FETCH (UID 102 FLAGS (\\Seen))\r\n"
+                 "* 4 FETCH (UID 104 FLAGS ())\r\n* 5 FETCH (UID 106 FLAGS ())\r\nA8 OK Success\r\n"},
+                {"A9 UID STORE 100 +FLAGS.SILENT (\\Seen)\r\n", "A9 OK Success\r\n"},
+                {"A10 LIST \"\" \"*\"\r\n",
+                 "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasChildren \\Noselect) \"/\" \"[Gmail]\"\r\n"
+                 "* LIST (\\All \\HasNoChildren) \"/\" \"[Gmail]/All Mail\"\r\n"
+                 "* LIST (\\HasNoChildren \\Trash) \"/\" \"[Gmail]/Trash\"\r\nA10 OK Success\r\n"},
+                {"A11 UID MOVE 101,104 \"[Gmail]/Trash\"\r\n",
+                 "* OK [COPYUID 7 101,104 90:91]\r\n* 2 EXPUNGE\r\n* 3 EXPUNGE\r\nA11 OK Success\r\n"},
+                {"A12 LOGOUT\r\n", "* BYE\r\nA12 OK\r\n"},
+            };
+            imap_steps.insert(imap_steps.end(), more.begin(), more.end());
+        } else {
+            imap_steps.push_back({"A8 LOGOUT\r\n", "* BYE\r\nA8 OK\r\n"});
+        }
     }
 
     ScriptedServer imap(imap_steps, 11);
@@ -209,6 +237,9 @@ int main(int argc, char **argv) {
     ScriptedServer google(google_steps, 11);
     Servers servers(imap, smtp, google);
     TestHost host(servers, scenario != "offline");
+    if (changes) {
+        host.links_ = links;
+    }
 
     static const HotSync_Io io = {port_read, port_write, port_millis};
     static uint8_t memory[HOTSYNC_BUFFER_SIZE(MAILSYNC_RECORD_MAX)];
@@ -231,6 +262,23 @@ int main(int argc, char **argv) {
     } else {
         ok = smtp.finished("smtp") && imap.finished("imap") && google.finished("google");
         ok = ok && (scenario == "bad-imap" ? !host.stored_ : host.stored_ && host.uid_validity_ == 1700000001 && host.last_uid_ == 212);
+        // Remembered afterwards: the new messages, and the old ones still on both sides
+        std::vector<MailLink> wanted = {{0x00A00003, 210, false}, {0x00A00004, 212, true}};
+        if (changes) {
+            wanted.insert(wanted.begin(), {{0x00B00001, 100, true}, {0x00B00003, 102, true}, {0x00B00007, 106, false}});
+        }
+        if (scenario == "bad-imap") {
+            wanted.clear();
+        }
+        bool same = host.links_.size() == wanted.size();
+        for (size_t i = 0; same && i < wanted.size(); i++) {
+            same = host.links_[i].record_id == wanted[i].record_id && host.links_[i].uid == wanted[i].uid &&
+                   host.links_[i].read == wanted[i].read;
+        }
+        for (size_t i = 0; !same && i < host.links_.size(); i++) {
+            printf("link: %08x %u %d\n", (unsigned)host.links_[i].record_id, (unsigned)host.links_[i].uid, host.links_[i].read);
+        }
+        ok = ok && same;
     }
     printf(ok ? "done\n" : "FAILED: servers or position not as expected\n");
     return ok ? 0 : 1;

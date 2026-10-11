@@ -249,6 +249,39 @@ static void test_xoauth2(size_t piece) {
     }
 }
 
+// Passing on read and deleted: the trash in the account's language, and servers without MOVE or a trash
+static void test_imap_changes(size_t piece) {
+    {
+        ScriptedServer server({{"", "* OK Gimap ready\r\n"},
+                               {"A1 LOGIN \"me\" \"x\"\r\n", "A1 OK\r\n"},
+                               {"A2 SELECT INBOX\r\n", "* 3 EXISTS\r\n* OK [UIDVALIDITY 7] UIDs valid.\r\nA2 OK [READ-WRITE] INBOX selected.\r\n"},
+                               {"A3 UID FETCH 5,9 (UID FLAGS)\r\n", "* 2 FETCH (UID 9 FLAGS (\\Seen))\r\nA3 OK Success\r\n"},
+                               {"A4 UID STORE 5 +FLAGS.SILENT (\\Seen)\r\n", "A4 OK Success\r\n"},
+                               {"A5 LIST \"\" \"*\"\r\n",
+                                "* LIST (\\HasNoChildren) \"/\" INBOX\r\n"
+                                "* LIST (\\HasNoChildren \\Trash) \"/\" {29}\r\n[Gmail]/&BBoEPgRABDcEOAQ9BDA-\r\n"
+                                "* LIST (\\HasNoChildren \\Junk) \"/\" \"[Gmail]/&BCEEPwQwBDw-\"\r\nA5 OK Success\r\n"},
+                               {"A6 UID MOVE 5 \"[Gmail]/&BBoEPgRABDcEOAQ9BDA-\"\r\n", "A6 BAD Unknown command\r\n"},
+                               {"A7 UID COPY 5 \"[Gmail]/&BBoEPgRABDcEOAQ9BDA-\"\r\n", "A7 OK [COPYUID 1 5 8] Success\r\n"},
+                               {"A8 UID STORE 5 +FLAGS.SILENT (\\Deleted)\r\n", "A8 OK Success\r\n"},
+                               {"A9 EXPUNGE\r\n", "* 1 EXPUNGE\r\nA9 OK Success\r\n"},
+                               {"A10 UID STORE 9 +FLAGS.SILENT (\\Deleted)\r\n", "A10 OK Success\r\n"},
+                               {"A11 EXPUNGE\r\n", "A11 OK Success\r\n"}}, piece);
+        ImapClient imap(server, idle);
+        uint32_t validity = 0, exists = 0;
+        std::vector<ImapMessage> flags;
+        std::string trash;
+        expect_true("select", imap.open("h", 993, "me", "x") && imap.select_inbox(&validity, &exists) && validity == 7 && exists == 3);
+        expect_true("flags", imap.fetch_flags({5, 9}, flags) && flags.size() == 1 && flags[0].uid == 9 && flags[0].seen);
+        expect_true("mark read", imap.mark_read({5}) && imap.mark_read({}));
+        expect_true("find trash", imap.find_trash(trash));
+        expect("trash name", trash, "[Gmail]/&BBoEPgRABDcEOAQ9BDA-");
+        expect_true("remove without MOVE", imap.remove({5}, trash));
+        expect_true("remove without trash", imap.remove({9}, ""));
+        expect_true("changes script", server.finished("changes"));
+    }
+}
+
 int main() {
     // The same conversations with the answers arriving whole, and in small pieces
     static const size_t pieces[] = {4096, 7, 1};
@@ -256,6 +289,7 @@ int main() {
         test_imap(pieces[i]);
         test_smtp(pieces[i]);
         test_xoauth2(pieces[i]);
+        test_imap_changes(pieces[i]);
     }
     test_imap_failures();
     printf(s_failures == 0 ? "mailnet: all passed\n" : "mailnet: %d FAILED\n", s_failures);

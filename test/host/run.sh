@@ -70,10 +70,12 @@ echo "hotsync: all passed (requests identical to pilot-link; $((last * 2 + 1)) r
 
 # Whole mail syncs: the conduit between the simulated Palm and scripted mail
 # servers. What the Palm holds afterwards must be exactly what is expected.
-for scenario in normal bad-imap offline oauth; do
+for scenario in normal bad-imap offline oauth changes; do
+    inbox=""
+    [ "$scenario" = changes ] && inbox="--inbox $here/data/mailsync-changes-inbox.json"
     mkfifo "$out/$scenario.tty"
     python3 "$here/fake_palm.py" --log "$out/$scenario.log" --state "$out/$scenario.json" --time "2026-10-11 18:30:00" \
-        --outbox "$here/data/outbox1.bin" --outbox "$here/data/outbox2.bin" > "$out/$scenario.tty" 2> "$out/$scenario.err" &
+        --outbox "$here/data/outbox1.bin" --outbox "$here/data/outbox2.bin" $inbox > "$out/$scenario.tty" 2> "$out/$scenario.err" &
     read tty < "$out/$scenario.tty"
     "$out/mailsync_test" "$tty" "$scenario" "$here/data/outbox1.bin" "$here/data/outbox2.bin" > "$out/$scenario.out" 2>&1 || true
     wait $! 2>/dev/null || true

@@ -630,16 +630,19 @@ bool hotsync_read_next_in_category(uint8_t handle, uint8_t category, HotSync_Rec
     return read_record_call(DLP_READ_NEXT_IN_CAT, 2, record);
 }
 
-bool hotsync_read_record(uint8_t handle, uint32_t id, HotSync_Record *record) {
+bool hotsync_read_record_start(uint8_t handle, uint32_t id, size_t max_len, HotSync_Record *record) {
     uint8_t *arg = s_msg + DLP_ARG_OFFSET;
     arg[0] = handle;
     arg[1] = 0;
     put32(arg + 2, id);
     put16(arg + 6, 0); // From the start of the record
-    // No more than fits the working memory: the rest would only be dropped
-    size_t room = s_msg_size - 8 - DLP_READ_HEADER;
-    put16(arg + 8, (uint16_t)(room < 0xFF00 ? room : 0xFF00));
+    put16(arg + 8, (uint16_t)(max_len < 0xFF00 ? max_len : 0xFF00));
     return read_record_call(DLP_READ_RECORD, 10, record);
+}
+
+bool hotsync_read_record(uint8_t handle, uint32_t id, HotSync_Record *record) {
+    // No more than fits the working memory: the rest would only be dropped
+    return hotsync_read_record_start(handle, id, s_msg_size - 8 - DLP_READ_HEADER, record);
 }
 
 uint8_t *hotsync_record_buffer(size_t *max_len) {

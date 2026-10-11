@@ -302,6 +302,7 @@ The Palm's built-in **Mail** application has no network code: it only exchanges 
 
 - Messages in the **Outbox** are sent (SMTP) and then removed from the Palm.
 - Messages that arrived in the account's inbox since the last sync are copied to the Palm's **Inbox** (IMAP).
+- What became of messages copied earlier is passed on, both ways: read on one side, read on the other; deleted on the Palm, moved to the account's trash; gone from the account's inbox (deleted or archived elsewhere), gone from the Palm's Inbox.
 
 No computer is involved; the adapter only needs USB power and a saved Wi-Fi network.
 
@@ -355,7 +356,8 @@ The outcome is written to the **HotSync log** on the Palm (HotSync → Log), for
 - Only the 15 newest messages of the inbox are looked at in one sync. If more than that arrived since the last sync, the older ones are passed over for good. The first sync fetches the 15 newest.
 - Messages arrive as text. Of a message with several parts the plain text is taken; a message that only exists as HTML is reduced to its text; attachments are left out.
 - Text is converted to the Palm's character set (Windows-1252). Accented letters it lacks become plain letters, other scripts become `?`. With a Cyrillic localisation on the Palm, switch "Text" on the Mail page to Cyrillic (Windows-1251).
-- **Nothing is changed on the server.** The mailbox is opened read-only: reading or deleting a message on the Palm does not mark or delete it in the account. A message already read elsewhere arrives marked as read.
+- **Read and deleted, both ways.** A message read on the Palm is marked read in the account at the next sync, and one read elsewhere becomes read on the Palm. A message deleted on the Palm (it goes to Mail's Deleted folder) is moved to the account's trash (Gmail: "Trash", in the account's language) and purged from the Palm; a server without a trash folder deletes it. A message deleted or archived elsewhere leaves the Palm's Inbox; one filed on the Palm stays there.
+- This applies to messages the adapter copied to the Palm, and to the newest 200 of them; messages from before this version are not followed. Without such changes the inbox is opened read-only.
 - A sent message leaves the Outbox once the server has accepted it. Gmail keeps its own copy under "Sent"; other providers may not.
 - Messages deleted on the Palm are purged from its memory during the sync.
 - The signature set in Mail's preferences is appended to messages that ask for it.
@@ -457,7 +459,7 @@ test/host/run.sh
 - **Mail text:** records of the Mail database, character sets, MIME encodings, HTML to text, headers, dates.
 - **IMAP and SMTP clients:** against scripted servers that answer as Gmail does, with the answers arriving whole and one byte at a time; with passwords and with Google sign-in (XOAUTH2).
 - **Google sign-in:** the consent address, the PKCE challenge (RFC 7636 example), taking the code from a pasted address, and the token server's answers (tokens, revoked token, wrong client).
-- **Whole mail syncs:** the conduit between the simulated Palm and the scripted servers, with a password and with Google sign-in; what the Palm holds afterwards is compared with the expected contents.
+- **Whole mail syncs:** the conduit between the simulated Palm and the scripted servers, with a password, with Google sign-in, and with messages read, deleted, filed and archived on either side; what the Palm holds afterwards is compared with the expected contents.
 
 ---
 

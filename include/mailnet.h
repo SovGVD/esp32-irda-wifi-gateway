@@ -7,8 +7,8 @@
 #include "mailtext.h"
 
 // IMAP and SMTP clients, as far as a Palm mail conduit needs them: read the
-// newest messages of the inbox without changing anything on the server, and
-// submit messages. The connection is abstract (TLS on the ESP32, a script in
+// newest messages of the inbox, pass on what became of messages on the Palm
+// (read, deleted), and submit messages. The connection is abstract (TLS on the ESP32, a script in
 // the host tests), so nothing here depends on the ESP32.
 
 #define MAILNET_TIMEOUT_MS  20000  // Longest wait for the server to say something
@@ -88,11 +88,21 @@ public:
               bool xoauth2 = false);
     // Opens the inbox read-only: nothing this client does changes the mailbox
     bool examine_inbox(uint32_t *uid_validity, uint32_t *exists);
+    // Opens the inbox for changes (flags, removing messages)
+    bool select_inbox(uint32_t *uid_validity, uint32_t *exists);
     // The newest `count` messages, oldest first (deleted ones left out)
     bool list_newest(uint32_t exists, uint32_t count, std::vector<ImapMessage> &out);
     bool fetch_summary(uint32_t uid, std::string &headers, std::string &internal_date, ImapPart &part);
     // The first `max_bytes` of a part, passed through the decoder
     bool fetch_text(uint32_t uid, const ImapPart &part, uint32_t max_bytes, MailTextDecoder &decoder);
+    // Which of these messages are still there, and whether they are read
+    bool fetch_flags(const std::vector<uint32_t> &uids, std::vector<ImapMessage> &out);
+    bool mark_read(const std::vector<uint32_t> &uids);
+    // The mailbox deleted messages go to (Gmail: "[Gmail]/Trash", in the
+    // account's language); empty if the server names none
+    bool find_trash(std::string &mailbox);
+    // Into `trash`, or (if empty) deleted for good
+    bool remove(const std::vector<uint32_t> &uids, const std::string &trash);
     void close();
     const std::string &error() const { return error_; }
 
@@ -117,6 +127,8 @@ private:
     bool on_list();
     bool on_summary();
     bool on_text();
+    bool on_folder();
+    bool open_inbox(const char *command, uint32_t *uid_validity, uint32_t *exists);
 
     MailStream stream_;
     std::string error_;
@@ -130,4 +142,5 @@ private:
     std::string *internal_date_ = nullptr;
     ImapPart *part_ = nullptr;
     MailTextDecoder *decoder_ = nullptr;
+    std::string *trash_ = nullptr;
 };

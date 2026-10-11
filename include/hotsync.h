@@ -69,6 +69,8 @@ bool hotsync_open_db(const char *name, uint8_t mode, uint8_t *handle);
 bool hotsync_close_db(uint8_t handle);
 bool hotsync_read_next_in_category(uint8_t handle, uint8_t category, HotSync_Record *record);
 bool hotsync_read_record(uint8_t handle, uint32_t id, HotSync_Record *record);
+// Only the first max_len bytes of the record (with its attributes and category)
+bool hotsync_read_record_start(uint8_t handle, uint32_t id, size_t max_len, HotSync_Record *record);
 bool hotsync_delete_record(uint8_t handle, uint32_t id);
 bool hotsync_cleanup_db(uint8_t handle);
 bool hotsync_reset_sync_flags(uint8_t handle);
