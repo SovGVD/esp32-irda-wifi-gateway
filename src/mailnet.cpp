@@ -1,4 +1,5 @@
 #include "mailnet.h"
+#include "mailoauth.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +125,11 @@ bool SmtpClient::command(const std::string &text, int expected, const char *what
         return false;
     }
     int code = reply();
+    if (code == 334 && expected != 334) {
+        // A challenge nobody asked for: a refused XOAUTH2 token comes with one
+        // (the reason, in base64). An empty line ends the exchange.
+        code = stream_.send("\r\n") ? reply() : -1;
+    }
     if (code == expected) {
         return true;
     }
@@ -131,13 +137,17 @@ bool SmtpClient::command(const std::string &text, int expected, const char *what
     return false;
 }
 
-bool SmtpClient::open(const std::string &host, uint16_t port, const std::string &user, const std::string &password) {
+bool SmtpClient::open(const std::string &host, uint16_t port, const std::string &user, const std::string &password,
+                      bool xoauth2) {
     if (!stream_.connect(host, port)) {
         error_ = "cannot connect to " + shortened(host);
         return false;
     }
     if (!command("", 220, "greeting") || !command("EHLO palm.local", 250, "hello")) {
         return false;
+    }
+    if (xoauth2) {
+        return command("AUTH XOAUTH2 " + mail_xoauth2(user, password), 235, "login");
     }
     std::string login;
     login += '\0';
@@ -373,6 +383,15 @@ bool ImapClient::command(const std::string &text, Handler handler, const char *w
             error_ = std::string("IMAP ") + what + ": " + (complete ? shortened(rest) : std::string("no answer"));
             return false;
         }
+        if (token.type == ATOM && token.text == "+") {
+            // The server waits for more from us. Only a refused XOAUTH2 token
+            // leads here (the reason follows, in base64): an empty line ends it.
+            if (!skip_line() || !stream_.send("\r\n")) {
+                error_ = std::string("IMAP ") + what + ": no answer";
+                return false;
+            }
+            continue;
+        }
         bool untagged = token.type == ATOM && token.text == "*";
         bool understood = (untagged && handler != nullptr) ? (this->*handler)() : skip_value(token) && skip_line();
         if (!understood) {
@@ -397,7 +416,8 @@ static std::string quoted(const std::string &text) {
     return out + "\"";
 }
 
-bool ImapClient::open(const std::string &host, uint16_t port, const std::string &user, const std::string &password) {
+bool ImapClient::open(const std::string &host, uint16_t port, const std::string &user, const std::string &password,
+                      bool xoauth2) {
     if (!stream_.connect(host, port)) {
         error_ = "cannot connect to " + shortened(host);
         return false;
@@ -406,6 +426,9 @@ bool ImapClient::open(const std::string &host, uint16_t port, const std::string 
     if (!stream_.line(greeting) || greeting.compare(0, 4, "* OK") != 0) {
         error_ = "IMAP greeting: " + (greeting.empty() ? std::string("no answer") : shortened(greeting));
         return false;
+    }
+    if (xoauth2) {
+        return command("AUTHENTICATE XOAUTH2 " + mail_xoauth2(user, password), nullptr, "login");
     }
     return command("LOGIN " + quoted(user) + " " + quoted(password), nullptr, "login");
 }

@@ -2,8 +2,9 @@
 // over a pseudo terminal, and IMAP / SMTP to scripted servers. run.sh compares
 // what the simulated Palm holds afterwards with the expected contents.
 //
-//   mailsync_test <terminal> normal|bad-imap|offline <outbox record files...>
+//   mailsync_test <terminal> normal|bad-imap|offline|oauth <outbox record files...>
 #include "hotsync.h"
+#include "mailoauth.h"
 #include "mailsync.h"
 #include "scripted_server.h"
 #include <fcntl.h>
@@ -36,10 +37,10 @@ static uint32_t port_millis() {
 // One connection object, as on the ESP32; the server it reaches depends on the name
 class Servers : public MailConnection {
 public:
-    Servers(ScriptedServer &imap, ScriptedServer &smtp) : imap_(imap), smtp_(smtp) {}
+    Servers(ScriptedServer &imap, ScriptedServer &smtp, ScriptedServer &google) : imap_(imap), smtp_(smtp), google_(google) {}
 
     bool connect(const char *host, uint16_t port) override {
-        current_ = (strncmp(host, "imap", 4) == 0) ? &imap_ : &smtp_;
+        current_ = (strncmp(host, "imap", 4) == 0) ? &imap_ : (strncmp(host, "oauth2", 6) == 0) ? &google_ : &smtp_;
         return current_->connect(host, port);
     }
     int read(uint8_t *dest, size_t max_len, uint32_t timeout_ms) override { return current_->read(dest, max_len, timeout_ms); }
@@ -49,6 +50,7 @@ public:
 private:
     ScriptedServer &imap_;
     ScriptedServer &smtp_;
+    ScriptedServer &google_;
     ScriptedServer *current_ = nullptr;
 };
 
@@ -120,6 +122,27 @@ int main(int argc, char **argv) {
     setup.imap_host = "imap.gmail.com";
     setup.smtp_host = "smtp.gmail.com";
     setup.max_fetch = 4;
+    // Google sign-in: one access token for both servers, fetched once
+    bool oauth = scenario == "oauth";
+    std::string smtp_login = "AUTH PLAIN AG1lQGdtYWlsLmNvbQBzZWNyZXQ=\r\n";
+    std::string imap_login = "A1 LOGIN \"me@gmail.com\" \"secret\"\r\n";
+    std::vector<Step> google_steps;
+    if (oauth) {
+        setup.password.clear();
+        setup.oauth_client_id = "123-abc.apps.googleusercontent.com";
+        setup.oauth_client_secret = "GOCSPX-secret";
+        setup.oauth_refresh_token = "1//0g-refresh";
+        std::string form = "grant_type=refresh_token&refresh_token=1%2F%2F0g-refresh&client_id=123-abc.apps.googleusercontent.com"
+                           "&client_secret=GOCSPX-secret";
+        std::string body = "{\n  \"access_token\": \"ya29.access\",\n  \"expires_in\": 3599,\n  \"token_type\": \"Bearer\"\n}";
+        google_steps = {{"", ""},
+                        {"POST /token HTTP/1.0\r\nHost: oauth2.googleapis.com\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+                         "Accept: application/json\r\nContent-Length: " + std::to_string(form.length()) + "\r\nConnection: close\r\n\r\n" + form,
+                         "HTTP/1.0 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: " +
+                             std::to_string(body.length()) + "\r\n\r\n" + body}};
+        smtp_login = "AUTH XOAUTH2 " + mail_xoauth2("me@gmail.com", "ya29.access") + "\r\n";
+        imap_login = "A1 AUTHENTICATE XOAUTH2 " + mail_xoauth2("me@gmail.com", "ya29.access") + "\r\n";
+    }
 
     // --- SMTP: one transaction per Outbox record ---
     MailIdentity sender;
@@ -128,7 +151,7 @@ int main(int argc, char **argv) {
     std::vector<Step> smtp_steps = {
         {"", "220 smtp.gmail.com ESMTP x1 - gsmtp\r\n"},
         {"EHLO palm.local\r\n", "250-smtp.gmail.com at your service\r\n250-8BITMIME\r\n250 SMTPUTF8\r\n"},
-        {"AUTH PLAIN AG1lQGdtYWlsLmNvbQBzZWNyZXQ=\r\n", "235 2.7.0 Accepted\r\n"},
+        {smtp_login, "235 2.7.0 Accepted\r\n"},
     };
     for (int i = 3; i < argc; i++) {
         std::vector<std::string> recipients;
@@ -147,10 +170,10 @@ int main(int argc, char **argv) {
     const std::string header_item = "BODY[HEADER.FIELDS (FROM TO CC REPLY-TO SUBJECT DATE X-PRIORITY IMPORTANCE)] ";
     std::vector<Step> imap_steps = {{"", "* OK Gimap ready for requests\r\n"}};
     if (scenario == "bad-imap") {
-        imap_steps.push_back({"A1 LOGIN \"me@gmail.com\" \"secret\"\r\n", "A1 NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n"});
+        imap_steps.push_back({imap_login, "A1 NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n"});
     } else {
         std::vector<Step> rest = {
-            {"A1 LOGIN \"me@gmail.com\" \"secret\"\r\n", "* CAPABILITY IMAP4rev1 UNSELECT IDLE\r\nA1 OK me@gmail.com authenticated (Success)\r\n"},
+            {imap_login, "* CAPABILITY IMAP4rev1 UNSELECT IDLE\r\nA1 OK me@gmail.com authenticated (Success)\r\n"},
             {"A2 EXAMINE INBOX\r\n",
              "* FLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen)\r\n* OK [PERMANENTFLAGS ()] Flags permitted.\r\n"
              "* OK [UIDVALIDITY 1700000001] UIDs valid.\r\n* 7 EXISTS\r\n* 0 RECENT\r\n* OK [UIDNEXT 213] Predicted next UID.\r\n"
@@ -183,7 +206,8 @@ int main(int argc, char **argv) {
 
     ScriptedServer imap(imap_steps, 11);
     ScriptedServer smtp(smtp_steps, 11);
-    Servers servers(imap, smtp);
+    ScriptedServer google(google_steps, 11);
+    Servers servers(imap, smtp, google);
     TestHost host(servers, scenario != "offline");
 
     static const HotSync_Io io = {port_read, port_write, port_millis};
@@ -205,7 +229,7 @@ int main(int argc, char **argv) {
     if (scenario == "offline") {
         ok = !host.stored_;
     } else {
-        ok = smtp.finished("smtp") && imap.finished("imap");
+        ok = smtp.finished("smtp") && imap.finished("imap") && google.finished("google");
         ok = ok && (scenario == "bad-imap" ? !host.stored_ : host.stored_ && host.uid_validity_ == 1700000001 && host.last_uid_ == 212);
     }
     printf(ok ? "done\n" : "FAILED: servers or position not as expected\n");

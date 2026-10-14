@@ -62,6 +62,7 @@ void hotsync_keep_alive();
 
 // DLP calls. Each returns false on failure, with the reason in hotsync_error().
 bool hotsync_read_sys_info(uint32_t *rom_version);
+bool hotsync_read_user_id(uint32_t *user_id);
 bool hotsync_get_time(HotSync_Time *time);
 bool hotsync_open_conduit();
 bool hotsync_read_preference(uint32_t creator, uint16_t id, bool saved, const uint8_t **data, size_t *len);
@@ -69,6 +70,8 @@ bool hotsync_open_db(const char *name, uint8_t mode, uint8_t *handle);
 bool hotsync_close_db(uint8_t handle);
 bool hotsync_read_next_in_category(uint8_t handle, uint8_t category, HotSync_Record *record);
 bool hotsync_read_record(uint8_t handle, uint32_t id, HotSync_Record *record);
+// Includes deleted records; index is stable until records are written/deleted.
+bool hotsync_read_record_by_index(uint8_t handle, uint16_t index, HotSync_Record *record);
 bool hotsync_delete_record(uint8_t handle, uint32_t id);
 bool hotsync_cleanup_db(uint8_t handle);
 bool hotsync_reset_sync_flags(uint8_t handle);

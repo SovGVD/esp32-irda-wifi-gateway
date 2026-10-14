@@ -21,6 +21,11 @@ struct MailSyncSetup {
     std::string name;        // Sender name; Palm character set; may be empty
     std::string login;
     std::string password;
+    // Google sign-in instead of the password (see mailoauth.h): with a refresh
+    // token, a fresh access token is the login for both servers
+    std::string oauth_client_id;
+    std::string oauth_client_secret;
+    std::string oauth_refresh_token;
     std::string imap_host;
     uint16_t imap_port = 993;
     std::string smtp_host;

@@ -441,7 +441,7 @@ void hotsync_keep_alive() {
 // Sends a request whose single argument (arg_len bytes, or none if negative)
 // is already at s_msg + DLP_ARG_OFFSET, and reads the answer into s_msg.
 // On success *reply / *reply_len describe the first argument of the answer.
-static bool dlp_call(uint8_t command, int arg_len, const uint8_t **reply, size_t *reply_len) {
+static bool dlp_call(uint8_t command, int arg_len, const uint8_t **reply, size_t *reply_len, uint8_t arg_id = DLP_ARG_ID) {
     if (s_error == HOTSYNC_ERR_LINK) {
         return false;
     }
@@ -458,14 +458,14 @@ static bool dlp_call(uint8_t command, int arg_len, const uint8_t **reply, size_t
         request = s_msg + DLP_ARG_OFFSET - 4;
         request[0] = command;
         request[1] = 1;
-        request[2] = DLP_ARG_ID;
+        request[2] = arg_id;
         request[3] = (uint8_t)arg_len;
         request_len = 4 + arg_len;
     } else {
         request = s_msg;
         request[0] = command;
         request[1] = 1;
-        request[2] = DLP_ARG_ID | DLP_ARG_SHORT;
+        request[2] = arg_id | DLP_ARG_SHORT;
         request[3] = 0;
         put16(request + 4, (uint16_t)arg_len);
         request_len = 6 + arg_len;
@@ -540,6 +540,13 @@ bool hotsync_read_sys_info(uint32_t *rom_version) {
     return true;
 }
 
+bool hotsync_read_user_id(uint32_t *user_id) {
+    const uint8_t *reply; size_t len;
+    if (!dlp_call_expect(0x10, -1, 4, &reply, &len)) return false;
+    *user_id = get32(reply);
+    return true;
+}
+
 bool hotsync_get_time(HotSync_Time *time) {
     const uint8_t *reply;
     size_t len;
@@ -604,10 +611,14 @@ bool hotsync_close_db(uint8_t handle) {
 }
 
 // Answer to the calls that read a record: id (4), index (2), size (2), attributes (1), category (1), data
-static bool read_record_call(uint8_t command, int arg_len, HotSync_Record *record) {
+static bool read_record_call(uint8_t command, int arg_len, HotSync_Record *record, uint8_t arg_id = DLP_ARG_ID) {
     const uint8_t *reply;
     size_t len;
-    if (!dlp_call_expect(command, arg_len, DLP_READ_HEADER, &reply, &len)) {
+    if (!dlp_call(command, arg_len, &reply, &len, arg_id)) {
+        return false;
+    }
+    if (reply == nullptr || len < DLP_READ_HEADER) {
+        s_error = HOTSYNC_ERR_PROTOCOL;
         return false;
     }
     size_t size = get16(reply + 6);
@@ -640,6 +651,17 @@ bool hotsync_read_record(uint8_t handle, uint32_t id, HotSync_Record *record) {
     size_t room = s_msg_size - 8 - DLP_READ_HEADER;
     put16(arg + 8, (uint16_t)(room < 0xFF00 ? room : 0xFF00));
     return read_record_call(DLP_READ_RECORD, 10, record);
+}
+
+bool hotsync_read_record_by_index(uint8_t handle, uint16_t index, HotSync_Record *record) {
+    uint8_t *arg = s_msg + DLP_ARG_OFFSET;
+    arg[0] = handle;
+    arg[1] = 0;
+    put16(arg + 2, index);
+    put16(arg + 4, 0);
+    size_t room = s_msg_size - 8 - DLP_READ_HEADER;
+    put16(arg + 6, (uint16_t)(room < 0xFF00 ? room : 0xFF00));
+    return read_record_call(DLP_READ_RECORD, 8, record, 0x21);
 }
 
 uint8_t *hotsync_record_buffer(size_t *max_len) {

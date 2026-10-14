@@ -156,7 +156,7 @@ static void append_utf8(std::string &out, uint32_t code) {
     }
 }
 
-static std::string palm_to_utf8(const std::string &text, PalmCharset charset) {
+std::string palm_to_utf8(const std::string &text, PalmCharset charset) {
     std::string out;
     for (size_t i = 0; i < text.length(); i++) {
         append_utf8(out, palm_to_unicode((uint8_t)text[i], charset));
@@ -1137,6 +1137,20 @@ std::string mail_compose(const MailMessage &msg, const MailIdentity &sender, Pal
         }
     } else {
         out += quoted_printable(text);
+    }
+    return out;
+}
+
+std::string palm_from_utf8(const std::string &text, PalmCharset charset, size_t max_chars) {
+    std::string out;
+    MailUtf8Reader reader;
+    uint32_t codes[4];
+    for (size_t i = 0; i <= text.size() && out.size() < max_chars; ++i) {
+        int n = i == text.size() ? reader.flush(codes) : reader.push((uint8_t)text[i], codes);
+        for (int k = 0; k < n && out.size() < max_chars; ++k) {
+            int c = palm_char(codes[k], charset);
+            if (c >= 0) out += (char)c;
+        }
     }
     return out;
 }

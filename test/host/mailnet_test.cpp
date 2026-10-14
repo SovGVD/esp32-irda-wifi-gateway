@@ -206,12 +206,56 @@ static void test_smtp(size_t piece) {
     expect("smtp bad login text", bad.error(), "SMTP login: 535 5.7.8  https://support.google.com/mail/?p=BadCredentials x1 - gsmt");
 }
 
+// Google sign-in: the access token as SASL XOAUTH2, accepted and refused
+static void test_xoauth2(size_t piece) {
+    const std::string token = "dXNlcj1tZUBnbWFpbC5jb20BYXV0aD1CZWFyZXIgeWEyOS50b2sBAQ==";
+    const std::string reason = "eyJzdGF0dXMiOiI0MDAiLCJzY2hlbWVzIjoiQmVhcmVyIiwic2NvcGUiOiJodHRwczovL21haWwuZ29vZ2xlLmNvbS8ifQ==";
+    {
+        ScriptedServer server({{"", "* OK Gimap ready\r\n"},
+                               {"A1 AUTHENTICATE XOAUTH2 " + token + "\r\n",
+                                "* CAPABILITY IMAP4rev1 UNSELECT IDLE\r\nA1 OK me@gmail.com authenticated (Success)\r\n"}}, piece);
+        ImapClient imap(server, idle);
+        expect_true("imap xoauth2", imap.open("imap.gmail.com", 993, "me@gmail.com", "ya29.tok", true));
+        expect_true("imap xoauth2 script", server.finished("imap xoauth2"));
+    }
+    {
+        ScriptedServer server({{"", "* OK Gimap ready\r\n"},
+                               {"A1 AUTHENTICATE XOAUTH2 " + token + "\r\n", "+ " + reason + "\r\n"},
+                               {"\r\n", "A1 NO [AUTHENTICATIONFAILED] Invalid credentials (Failure)\r\n"}}, piece);
+        ImapClient imap(server, idle);
+        expect_true("imap xoauth2 refused", !imap.open("imap.gmail.com", 993, "me@gmail.com", "ya29.tok", true));
+        expect("imap xoauth2 refused text", imap.error(), "IMAP login: [AUTHENTICATIONFAILED] Invalid credentials (Failure)");
+        expect_true("imap xoauth2 refused script", server.finished("imap xoauth2 refused"));
+    }
+    {
+        ScriptedServer server({{"", "220 smtp.gmail.com ESMTP\r\n"},
+                               {"EHLO palm.local\r\n", "250-smtp.gmail.com\r\n250 AUTH LOGIN PLAIN XOAUTH2\r\n"},
+                               {"AUTH XOAUTH2 " + token + "\r\n", "235 2.7.0 Accepted\r\n"},
+                               {"QUIT\r\n", "221 2.0.0 closing connection\r\n"}}, piece);
+        SmtpClient smtp(server, idle);
+        expect_true("smtp xoauth2", smtp.open("smtp.gmail.com", 465, "me@gmail.com", "ya29.tok", true));
+        smtp.close();
+        expect_true("smtp xoauth2 script", server.finished("smtp xoauth2"));
+    }
+    {
+        ScriptedServer server({{"", "220 smtp.gmail.com ESMTP\r\n"},
+                               {"EHLO palm.local\r\n", "250 smtp.gmail.com\r\n"},
+                               {"AUTH XOAUTH2 " + token + "\r\n", "334 " + reason + "\r\n"},
+                               {"\r\n", "535-5.7.8 Username and Password not accepted.\r\n535 5.7.8 https://support.google.com/mail/?p=BadCredentials\r\n"}}, piece);
+        SmtpClient smtp(server, idle);
+        expect_true("smtp xoauth2 refused", !smtp.open("smtp.gmail.com", 465, "me@gmail.com", "ya29.tok", true));
+        expect("smtp xoauth2 refused text", smtp.error(), "SMTP login: 535 5.7.8 https://support.google.com/mail/?p=BadCredentials");
+        expect_true("smtp xoauth2 refused script", server.finished("smtp xoauth2 refused"));
+    }
+}
+
 int main() {
     // The same conversations with the answers arriving whole, and in small pieces
     static const size_t pieces[] = {4096, 7, 1};
     for (size_t i = 0; i < sizeof(pieces) / sizeof(pieces[0]); i++) {
         test_imap(pieces[i]);
         test_smtp(pieces[i]);
+        test_xoauth2(pieces[i]);
     }
     test_imap_failures();
     printf(s_failures == 0 ? "mailnet: all passed\n" : "mailnet: %d FAILED\n", s_failures);
