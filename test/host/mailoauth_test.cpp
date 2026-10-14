@@ -41,7 +41,8 @@ static void test_pieces() {
            "https://mail.google.com/ https://www.googleapis.com/auth/tasks "
            "https://www.googleapis.com/auth/contacts https://www.googleapis.com/auth/calendar "
            "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/documents "
-           "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/presentations");
+           "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/presentations "
+           "https://www.googleapis.com/auth/userinfo.profile");
     std::string consent = oauth_consent_url("client", scopes, "challenge", "state", "");
     expect_true("all services in one consent request",
         consent.find("&scope=https%3A%2F%2Fmail.google.com%2F"
@@ -51,8 +52,11 @@ static void test_pieces() {
                      "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive"
                      "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments"
                      "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fspreadsheets"
-                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fpresentations&") != std::string::npos);
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fpresentations"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.profile&") != std::string::npos);
     expect_true("Contacts grant", oauth_has_scope(scopes, GOOGLE_CONTACTS_SCOPE));
+    expect_true("Contacts account identity grant", oauth_has_scope(scopes, GOOGLE_PROFILE_SCOPE));
+    expect_true("Contacts grant alone does not grant account profile", !oauth_has_scope(GOOGLE_CONTACTS_SCOPE, GOOGLE_PROFILE_SCOPE));
     expect_true("Calendar grant", oauth_has_scope(scopes, GOOGLE_CALENDAR_SCOPE));
     expect_true("Drive grant", oauth_has_scope(scopes, GOOGLE_DRIVE_SCOPE));
     expect_true("Docs grant", oauth_has_scope(scopes, GOOGLE_DOCS_SCOPE));
@@ -132,6 +136,7 @@ static void test_token_server(size_t piece) {
         expect_true("exchange tokens", tokens.access_token == "ya29.first" && tokens.refresh_token == "1//0g-refresh" &&
                                        tokens.expires_in == 3599 && tokens.scope == GOOGLE_MAIL_SCOPE);
         expect_true("old mail grant stays mail-only", !oauth_has_scope(tokens.scope, GOOGLE_CONTACTS_SCOPE));
+        expect_true("old token does not gain profile permission", !oauth_has_scope(tokens.scope, GOOGLE_PROFILE_SCOPE));
         expect_true("exchange script", server.finished("exchange") && server.closed_ && server.host_ == "oauth2.googleapis.com" &&
                                        server.port_ == 443);
     }
@@ -146,6 +151,7 @@ static void test_token_server(size_t piece) {
         expect_true("shared exchange", google.exchange_code(id, secret, "4/0Ab", "verifier-1", tokens));
         expect_true("shared scopes retained", tokens.scope == GOOGLE_DEFAULT_SCOPES &&
                     oauth_has_scope(tokens.scope, GOOGLE_CONTACTS_SCOPE) &&
+                    oauth_has_scope(tokens.scope, GOOGLE_PROFILE_SCOPE) &&
                     oauth_has_scope(tokens.scope, GOOGLE_CALENDAR_SCOPE) &&
                     oauth_has_scope(tokens.scope, GOOGLE_DRIVE_SCOPE) &&
                     oauth_has_scope(tokens.scope, GOOGLE_DOCS_SCOPE) &&

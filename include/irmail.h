@@ -6,8 +6,8 @@
 #include "mailoauth.h"
 
 // Standalone HotSync session: when no desktop answers, the adapter runs the
-// enabled Mail and Google Tasks conduits over Wi-Fi. Settings are independent
-// and entered in the portal. Mail uses IMAP/SMTP; Tasks uses Google OAuth.
+// enabled Mail, Tasks, Calendar and Contacts conduits over Wi-Fi. Settings are
+// independent and entered in the portal; Google services share OAuth.
 
 struct IrMailSettings {
     bool enabled = false;
@@ -26,6 +26,7 @@ struct IrMailSettings {
     String google_scopes;
     bool google_scope(const char *scope) const { return google() && oauth_has_scope(google_scopes.c_str(), scope); }
     bool google_tasks() const { return google_scope(GOOGLE_TASKS_SCOPE); }
+    bool google_contacts() const { return google_scope(GOOGLE_CONTACTS_SCOPE) && google_scope(GOOGLE_PROFILE_SCOPE); }
     bool google() const { return google_token.length() > 0; }
 };
 
@@ -36,7 +37,7 @@ const IrMailSettings &irmail_settings();
 void irmail_store_settings(const IrMailSettings &settings);
 void irmail_forget_position();  // The next sync fetches the newest messages again
 bool irmail_enabled();          // Mail account configured and enabled
-bool irmail_ready();            // Standalone session available for Mail or Tasks
+bool irmail_ready();            // Standalone session available for any enabled conduit
 String irmail_last_result();    // Outcome of the last sync, for the portal
 // Tries to log in to both servers; one line of text for each
 void irmail_check_login(String &receiving, String &sending);
@@ -49,7 +50,7 @@ void irmail_check_login(String &receiving, String &sending);
 String irmail_google_begin(const String &address, const String &client_id, const String &client_secret);
 bool irmail_google_finish(const String &pasted, String &message);
 void irmail_google_sign_out();
-// Shared token refresh used by the Tasks conduit and its login check.
+// Shared token refresh used by Google conduits and their login checks.
 bool irmail_google_access_token(std::string &token, std::string &problem, bool keep_alive = false);
 
 // A HotSync session handled by the conduit. `opening` is what the Palm sent

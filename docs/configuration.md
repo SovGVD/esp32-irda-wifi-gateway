@@ -1,0 +1,36 @@
+# Configuration reference
+
+[Documentation](README.md)
+
+Firmware settings are in [`include/config.h`](../include/config.h). Google scope definitions are in [`include/googlescopes.h`](../include/googlescopes.h).
+
+| Setting | Default | Purpose |
+|:--------|:--------|:--------|
+| `PIN_TFBS_TX` / `PIN_TFBS_RX` / `PIN_TFBS_SD` | 6 / 7 / 5 | GPIOs wired to the transceiver |
+| `PIN_STATUS_LED` | 8 | Status LED (`-1` for none); `LED_ON` / `LED_OFF` set its polarity |
+| `IRDA_TARGET_BAUD` | 57600 | Highest IR speed to negotiate with the Palm |
+| `IRDA_DEVICE_NAME` | `ESP32-IrCOMM` | Name the Palm sees during discovery |
+| `ENABLE_WIFI_GATEWAY` | 1 | Wi-Fi Internet gateway and portal on / off |
+| `PORTAL_DOMAIN` | `wifi.setup` | Name of the settings portal |
+| `WIFI_SSID` / `WIFI_PASSWORD` | empty | Default Wi-Fi network until one is chosen in the portal |
+| `WIFI_TX_POWER` | not set | Reduced Wi-Fi transmit power for boards that need it |
+| `PROXY_ALL_SITES_DEFAULT` | 1 | Web proxy on or off until changed in the portal |
+| `PROXY_MAX_PAGE_BYTES` | 48000 | Longer pages are cut off |
+| `XIINO_DATASERVER_HOST` | `pds.mobirus.com` | Name under which the adapter stands in for Xiino's DataServer |
+| `PPP_GATEWAY_IP` / `PPP_PALM_IP` | `192.168.99.1` / `.2` | Addresses on the link between adapter and Palm |
+| `MAIL_PC_ANSWER_TIMEOUT_MS` | 1500 | How long a HotSync waits for a desktop on USB before standalone Mail / Tasks / Calendar / Contacts sync |
+| `MAIL_DEFAULT_IMAP_SERVER` / `MAIL_DEFAULT_SMTP_SERVER` | Gmail's | Mail servers until others are entered in the portal |
+| `MAIL_MAX_PER_SYNC` / `MAIL_MAX_SEND_PER_SYNC` | 15 / 10 | Newest inbox messages looked at, and Outbox messages sent, per sync |
+| `MAIL_HTML_FETCH_MAX` | 96000 | Bytes read of a message that only exists as HTML |
+| `GOOGLE_SCOPES` | Mail + Tasks + Contacts + Calendar + Drive + Docs + Sheets + Slides + basic profile | Access asked for by the shared Google sign-in |
+| `GOOGLE_SETUP_WINDOW_MS` | 15 minutes | How long the sign-in page answers on the Wi-Fi side once opened from the Palm |
+| `MAIL_NTP_SERVER` | `pool.ntp.org` | Time server (for message dates) |
+| `TASKS_MAX_PER_SYNC` | 100 | Maximum Palm records and Google tasks in a snapshot |
+| `TASKS_HTTP_TIMEOUT_MS` / `TASKS_HTTP_RESPONSE_MAX` | 12000 / 24000 | HTTPS timeout and response byte limit |
+| `CALENDAR_MAX_PER_SYNC` | 64 | Maximum Calendar window, linked records and relevant Palm appointments |
+| `CALENDAR_PAST_DAYS` / `CALENDAR_FUTURE_DAYS` | 30 / 90 | Default rolling date window; adjustable on the Calendar page |
+| `CALENDAR_HTTP_TIMEOUT_MS` / `CALENDAR_HTTP_RESPONSE_MAX` | 12000 / 32000 | Calendar HTTPS timeout and response byte limit |
+| `CONTACTS_MAX_PER_SYNC` | 64 | Maximum Google, linked and relevant Palm contacts; the combined public book must also fit |
+| `CONTACTS_HTTP_TIMEOUT_MS` / `CONTACTS_HTTP_RESPONSE_MAX` | 12000 / 32000 | Contacts HTTPS timeout and response byte limit |
+| `ENABLE_CDC_DEBUG` | 0 | Print a protocol trace on USB instead of serial data |
+| `CURRENT_OP_MODE` | `MODE_IRCOMM` | `MODE_RAW_SIR` turns the adapter into a plain IR pulse bridge without the IrDA stack |

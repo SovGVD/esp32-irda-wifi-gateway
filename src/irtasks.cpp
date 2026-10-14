@@ -5,8 +5,7 @@
 #include "irdebug.h"
 #include <Preferences.h>
 #include <WiFi.h>
-#include "esp_http_client.h"
-#include "esp_crt_bundle.h"
+#include "irgooglehttp.h"
 #include "cJSON.h"
 #include <cstdlib>
 #include <cstring>
@@ -45,48 +44,6 @@ bool irtasks_store_settings(const IrTasksSettings &s) {
     if (ok) s_settings = s;
     return ok;
 }
-class EspTasksHttp : public TasksHttp {
-public:
-    explicit EspTasksHttp(bool keepalive = false) : keepalive_(keepalive) {}
-    int request(const std::string &url, const char *method, const std::string &auth,
-                const char *type, const std::string &body, std::string &reply) override {
-        reply.clear(); response_ = &reply; too_large_ = false;
-        esp_http_client_config_t config = {};
-        config.url = url.c_str(); config.crt_bundle_attach = esp_crt_bundle_attach;
-        config.timeout_ms = TASKS_HTTP_TIMEOUT_MS; config.disable_auto_redirect = true;
-        config.event_handler = event; config.user_data = this;
-        esp_http_client_handle_t client = esp_http_client_init(&config);
-        if (!client) return -1;
-        esp_http_client_method_t m = HTTP_METHOD_GET;
-        if (!strcmp(method, "POST")) m = HTTP_METHOD_POST;
-        else if (!strcmp(method, "PATCH")) m = HTTP_METHOD_PATCH;
-        else if (!strcmp(method, "DELETE")) m = HTTP_METHOD_DELETE;
-        esp_http_client_set_method(client, m);
-        esp_http_client_set_header(client, "Content-Type", type);
-        if (!auth.empty()) esp_http_client_set_header(client, "Authorization", auth.c_str());
-        if (!body.empty()) esp_http_client_set_post_field(client, body.data(), body.size());
-        if (keepalive_) hotsync_keep_alive();
-        esp_err_t err = esp_http_client_perform(client);
-        int code = err == ESP_OK && !too_large_ ? esp_http_client_get_status_code(client) : -1;
-        esp_http_client_cleanup(client); response_ = nullptr;
-        if (keepalive_) hotsync_keep_alive();
-        return code;
-    }
-private:
-    static esp_err_t event(esp_http_client_event_t *e) {
-        auto *self = (EspTasksHttp *)e->user_data;
-        if (self->keepalive_) hotsync_keep_alive();
-        if (e->event_id == HTTP_EVENT_ON_DATA && e->data_len > 0) {
-            if (self->response_->size() + e->data_len > TASKS_HTTP_RESPONSE_MAX) {
-                self->too_large_ = true; return ESP_FAIL;
-            }
-            self->response_->append((const char *)e->data, e->data_len);
-        }
-        return ESP_OK;
-    }
-    bool keepalive_, too_large_ = false;
-    std::string *response_ = nullptr;
-};
 class EspTasksHost : public TaskSyncHost {
 public:
     TasksHttp &http() override { return http_; }
@@ -147,7 +104,7 @@ public:
         free(raw); return ok;
     }
 private:
-    EspTasksHttp http_{true};
+    EspGoogleHttp http_{true, TASKS_HTTP_TIMEOUT_MS, TASKS_HTTP_RESPONSE_MAX};
 };
 String irtasks_last_result() { return s_result; }
 String irtasks_check_login() {
@@ -155,7 +112,7 @@ String irtasks_check_login() {
     if (WiFi.status() != WL_CONNECTED) return "Wi-Fi is not connected.";
     std::string token, problem;
     if (!irmail_google_access_token(token, problem)) return problem.c_str();
-    EspTasksHttp http; auto config = tasks_setup(); GoogleTasksClient client(http, config, token);
+    EspGoogleHttp http(false, TASKS_HTTP_TIMEOUT_MS, TASKS_HTTP_RESPONSE_MAX); auto config = tasks_setup(); GoogleTasksClient client(http, config, token);
     std::vector<GoogleTask> tasks;
     if (!client.list(tasks)) return client.error().c_str();
     return "OK, " + String((unsigned)tasks.size()) + " tasks (including deleted tasks).";

@@ -98,6 +98,12 @@ if [ ! -f "$cjson/cJSON.c" ]; then
     exit 1
 fi
 cc -O1 -g -fsanitize=address,undefined -I"$cjson" -c "$cjson/cJSON.c" -o "$out/cJSON.o"
+# Exercise the real ESP HTTPS adapter, including Google's long page-token URLs.
+g++ $flags -I"$here/esp_http_stubs" -I"$cjson" -o "$out/googlehttp_test" "$here/googlehttp_test.cpp" \
+    "$root/src/irgooglehttp.cpp" "$root/src/googlecalendar.cpp" "$root/src/calendartext.cpp" \
+    "$root/src/googlecontacts.cpp" "$root/src/contacttext.cpp" "$root/src/googletasks.cpp" \
+    "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$out/cJSON.o"
+"$out/googlehttp_test"
 g++ $flags -I"$cjson" -o "$out/tasksync_test" "$here/tasksync_test.cpp" "$root/src/tasksync.cpp" \
     "$root/src/googletasks.cpp" "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
 mkfifo "$out/tasks.tty"
@@ -113,3 +119,39 @@ fi
 wait "$palm_pid"
 grep -q '^done$' "$out/tasks.out" && grep -q '"ok": true' "$out/tasks.json"
 echo "tasksync: all passed (two-way sync, repeat syncs, pagination, field preservation, failures, deletion)"
+
+# Date Book conduit, using the same fake Palm and the Calendar REST client.
+g++ $flags -I"$cjson" -o "$out/calendarsync_test" "$here/calendarsync_test.cpp" "$root/src/calendartext.cpp" \
+    "$root/src/googlecalendar.cpp" "$root/src/calendarsync.cpp" "$root/src/mailoauth.cpp" \
+    "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
+mkfifo "$out/calendar.tty"
+python3 "$here/fake_palm.py" --calendar --log "$out/calendar.log" --state "$out/calendar.json" \
+    > "$out/calendar.tty" 2> "$out/calendar.err" &
+palm_pid=$!
+read tty < "$out/calendar.tty"
+if ! "$out/calendarsync_test" "$tty" > "$out/calendar.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/calendar.out" "$out/calendar.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/calendar.out" && grep -q '"ok": true' "$out/calendar.json"
+echo "calendarsync: all passed (timed/all-day, alarms, recurrence, DST, journalled inserts, failures, deletion)"
+
+# Address Book conduit and Google People API field-preserving mutations.
+g++ $flags -I"$cjson" -o "$out/contactsync_test" "$here/contactsync_test.cpp" "$root/src/contacttext.cpp" \
+    "$root/src/googlecontacts.cpp" "$root/src/contactsync.cpp" "$root/src/mailoauth.cpp" \
+    "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
+mkfifo "$out/contacts.tty"
+python3 "$here/fake_palm.py" --contacts --log "$out/contacts.log" --state "$out/contacts.json" \
+    > "$out/contacts.tty" 2> "$out/contacts.err" &
+palm_pid=$!
+read tty < "$out/contacts.tty"
+if ! "$out/contactsync_test" "$tty" > "$out/contacts.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/contacts.out" "$out/contacts.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/contacts.out" && grep -q '"ok": true' "$out/contacts.json"
+echo "contactsync: all passed (AddressDB codec, two-way edits, field preservation, identities, conflicts, journalled creation, deletion)"

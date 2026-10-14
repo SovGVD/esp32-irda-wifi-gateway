@@ -3,6 +3,8 @@
 #include "hotsync.h"
 #include "mailsync.h"
 #include "irtasks.h"
+#include "ircalendar.h"
+#include "ircontacts.h"
 #include "mailoauth.h"
 #include <WiFi.h>
 #include <Preferences.h>
@@ -101,7 +103,7 @@ bool irmail_enabled() {
 }
 
 bool irmail_ready() {
-    return s_from_palm != nullptr && (irmail_enabled() || irtasks_ready());
+    return s_from_palm != nullptr && (irmail_enabled() || irtasks_ready() || ircalendar_ready() || ircontacts_ready());
 }
 
 String irmail_last_result() {
@@ -249,7 +251,7 @@ void irmail_check_login(String &receiving, String &sending) {
 }
 
 // ------------------------------------------------------------------------------
-// Shared Google Sign-In (Mail and Tasks, from a PC browser)
+// Shared Google Sign-In (Mail, Tasks, Calendar and Contacts, from a PC browser)
 // ------------------------------------------------------------------------------
 
 // The sign-in in progress: what was entered, and the PKCE verifier whose
@@ -335,7 +337,7 @@ void irmail_google_sign_out() {
 }
 
 // Reuse the same TLS transport, OAuth client and stored Google credentials
-// for Tasks. The portal uses no HotSync keep-alive; the conduit does.
+// for Tasks, Calendar and Contacts. The portal uses no HotSync keep-alive; conduits do.
 bool irmail_google_access_token(std::string &token, std::string &problem, bool keep_alive) {
     token.clear();
     if (!keep_alive && s_running) { problem = "A HotSync is running. Try again when it is done."; return false; }
@@ -505,6 +507,24 @@ static void run_sync() {
             if (result.length()) result += "; ";
             result += "Tasks: " + summary;
         }
+        if (!lost && ircalendar_ready()) {
+            CalendarSyncResult calendar;
+            ircalendar_sync(calendar);
+            String summary=calendarsync_summary(calendar).c_str();
+            if (!calendar.link_lost) hotsync_add_log(("Calendar: "+summary+"\n").c_str());
+            lost=calendar.link_lost;
+            if (result.length()) result+="; ";
+            result+="Calendar: "+summary;
+        }
+        if (!lost && ircontacts_ready()) {
+            ContactSyncResult contacts;
+            ircontacts_sync(contacts);
+            String summary=contactsync_summary(contacts).c_str();
+            if (!contacts.link_lost) hotsync_add_log(("Contacts: "+summary+"\n").c_str());
+            lost=contacts.link_lost;
+            if (result.length()) result+="; ";
+            result+="Contacts: "+summary;
+        }
         if (lost) result += " (the link to the Palm was lost)";
         else hotsync_end(0);
     }
@@ -529,6 +549,8 @@ void irmail_init() {
     }
     load_settings();
     irtasks_init();
+    ircalendar_init();
+    ircontacts_init();
     s_from_palm = xStreamBufferCreate(MAIL_STREAM_SIZE, 1);
     s_to_palm = xStreamBufferCreate(MAIL_STREAM_SIZE, 1);
     if (s_from_palm == nullptr || s_to_palm == nullptr) {

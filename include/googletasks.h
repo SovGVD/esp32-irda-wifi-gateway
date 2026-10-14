@@ -3,15 +3,9 @@
 #include <vector>
 #include <stdint.h>
 
-// HTTPS transport supplied by the ESP32 or a scripted host test. Returns an
-// HTTP status, or a negative value on transport failure. No redirects/retries.
-class TasksHttp {
-public:
-    virtual ~TasksHttp() {}
-    virtual int request(const std::string &url, const char *method,
-                        const std::string &authorization, const char *content_type,
-                        const std::string &body, std::string &response) = 0;
-};
+#include "googlehttp.h"
+// Compatibility name for the existing Tasks host interface.
+using TasksHttp = GoogleHttp;
 struct GoogleTasksSetup {
     std::string list_id = "@default";
     unsigned max_tasks = 100;

@@ -30,6 +30,7 @@ bool GoogleTasksClient::call(const std::string &path, const char *method, const 
                             "/tasks" + path, method, "Bearer " + token_, "application/json", body, reply);
     if (code < 200 || code >= 300) {
         error_ = "Google Tasks request failed (HTTP " + std::to_string(code) + ")";
+        if (code<0 && !http_.error().empty()) error_="Google Tasks: "+http_.error();
         return false;
     }
     return true;
@@ -42,6 +43,7 @@ bool GoogleTasksClient::resolve_list(std::string &id) {
     id = field(j.get(), "id");
     if (code != 200 || id.empty()) {
         error_ = "Could not identify the Google task list (HTTP " + std::to_string(code) + ")";
+        if (code<0 && !http_.error().empty()) error_="Google Tasks: "+http_.error();
         return false;
     }
     return true;

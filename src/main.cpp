@@ -24,7 +24,7 @@ enum SessionType {
     SESSION_UNKNOWN, // Nothing received yet
     SESSION_SERIAL,  // HotSync or other serial data, bridged to USB CDC
     SESSION_PPP,     // Network connection, served by the Wi-Fi gateway
-    SESSION_MAIL     // HotSync that no desktop answered, served by the Mail / Tasks conduits
+    SESSION_MAIL     // HotSync that no desktop answered, served by the Mail / Tasks / Calendar / Contacts conduits
 };
 static SessionType s_session = SESSION_UNKNOWN;
 
@@ -478,7 +478,7 @@ static void queue_data_for_palm() {
 }
 
 // A HotSync (first byte 0xBE) that the USB host leaves unanswered is taken
-// over by the standalone conduits, if Mail or Tasks is set up
+// over by the standalone conduits, if any standalone conduit is set up
 static void hand_over_to_mail() {
     if (s_session != SESSION_SERIAL || !s_serial_is_hotsync || s_host_answered ||
         millis() - s_serial_since_ms < MAIL_PC_ANSWER_TIMEOUT_MS || !irmail_ready()) {
@@ -488,7 +488,7 @@ static void hand_over_to_mail() {
     if (irmail_start(s_opening, s_opening_len)) {
         s_session = SESSION_MAIL;
         s_usb_to_ir_fifo.clear();
-        irdbg_printf("No desktop answered the HotSync: mail session started");
+        irdbg_printf("No desktop answered the HotSync: standalone session started");
     }
 }
 
@@ -617,7 +617,7 @@ void setup() {
     // 5. Start Wi-Fi and the PPP gateway (no-op when WIFI_SSID is empty)
     irppp_init();
 
-    // 6. Standalone Mail / Tasks conduits for HotSync sessions that no desktop answers
+    // 6. Standalone Mail / Tasks / Calendar / Contacts conduits for HotSync sessions that no desktop answers
     irmail_init();
 }
 

@@ -2,11 +2,18 @@
 #include "irppp.h"
 #include "irmail.h"
 #include "irtasks.h"
+#include "ircalendar.h"
+#include "ircontacts.h"
 #include "irdebug.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_ota_ops.h"
+#include "nvs.h"
 #include <lwip/sockets.h>
 #include <lwip/inet.h>
 
@@ -75,6 +82,8 @@ static String s_request_body;      // Form fields of a POST, passed on by the pr
 static bool s_google_window_open = false;
 static uint32_t s_google_window_since = 0;
 static bool s_google_from_tasks = false;
+static bool s_google_from_calendar = false;
+static bool s_google_from_contacts = false;
 
 // Web proxy for all sites (see the proxy section); switched from the status page
 static bool s_proxy_all_sites = PROXY_ALL_SITES_DEFAULT;
@@ -564,6 +573,12 @@ public:
         out_ += wml_ ? "</p>\r\n" : "</P>\r\n";
     }
 
+    void heading(const String &text) {
+        out_ += wml_ ? "<p><b>" : "<H4>";
+        out_ += escape(text,wml_);
+        out_ += wml_ ? "</b></p>\r\n" : "</H4>\r\n";
+    }
+
     void link(const String &href, const String &label) {
         out_ += wml_ ? "<p><a href=\"" : "<P><A HREF=\"";
         out_ += href;
@@ -700,6 +715,8 @@ static void handle_status() {
     page.link("/mail", mail.address.length() == 0 ? String("Mail: not set up")
                                                   : String(irmail_enabled() ? "Mail: on, " : "Mail: off, ") + mail.address);
 
+    page.link("/calendar", ircalendar_ready() ? "Google Calendar: on" : "Google Calendar: off");
+    page.link("/contacts", ircontacts_ready() ? "Address Book: on" : "Address Book: off");
     page.link("/tasks", irtasks_ready() ? "Google Tasks: on" : "Google Tasks: off");
 
     page.link("/", "Refresh");
@@ -794,10 +811,90 @@ static void handle_networks(bool rescan) {
     page.send();
 }
 
+static String diagnostic_bytes(size_t bytes) {
+    return String((unsigned long)bytes)+" B ("+String(bytes/1024.0,1)+" KiB)";
+}
+
+static const char *reset_reason_name(esp_reset_reason_t reason) {
+    switch (reason) {
+    case ESP_RST_POWERON: return "power on";
+    case ESP_RST_EXT: return "external reset";
+    case ESP_RST_SW: return "software reset";
+    case ESP_RST_PANIC: return "crash/panic";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "wake from deep sleep";
+    case ESP_RST_BROWNOUT: return "power brownout";
+    case ESP_RST_SDIO: return "SDIO reset";
+    default: return "unknown";
+    }
+}
+
+static void show_esp_status(Page &page,const multi_heap_info_t &heap,uint64_t uptime_seconds) {
+    page.heading("ESP status");
+    page.line(String("Chip: ")+ESP.getChipModel()+", revision "+String(ESP.getChipRevision())+
+              ", cores: "+String(ESP.getChipCores()));
+    page.line("CPU clock: "+String(getCpuFrequencyMhz())+" MHz; tasks: "+String((unsigned)uxTaskGetNumberOfTasks()));
+    char uptime[64];
+    snprintf(uptime,sizeof(uptime),"%lu days %02u:%02u:%02u",(unsigned long)(uptime_seconds/86400),
+             (unsigned)(uptime_seconds/3600%24),(unsigned)(uptime_seconds/60%60),(unsigned)(uptime_seconds%60));
+    page.line(String("Uptime: ")+uptime);
+    page.line(String("Last reset: ")+reset_reason_name(esp_reset_reason()));
+
+    const size_t total=heap.total_allocated_bytes+heap.total_free_bytes;
+    page.line("Internal heap used: "+diagnostic_bytes(heap.total_allocated_bytes)+
+              " ("+String(total ? heap.total_allocated_bytes*100.0/total : 0.0,1)+"%)");
+    page.line("Heap total: "+diagnostic_bytes(total));
+    page.line("Heap free: "+diagnostic_bytes(heap.total_free_bytes));
+    page.line("Lowest free heap since boot: "+diagnostic_bytes(heap.minimum_free_bytes));
+    page.line("Largest allocatable heap block: "+diagnostic_bytes(heap.largest_free_block));
+    if (ESP.getPsramSize()) {
+        page.line("PSRAM total: "+diagnostic_bytes(ESP.getPsramSize())+"; free: "+diagnostic_bytes(ESP.getFreePsram()));
+    } else page.line("PSRAM: not available");
+
+    page.line("Flash capacity: "+diagnostic_bytes(ESP.getFlashChipSize()));
+    const esp_partition_t *app=esp_ota_get_running_partition();
+    // Arduino verifies the flash image to obtain its length. Cache this once
+    // per boot rather than repeating that work on every diagnostics refresh.
+    static const uint32_t image_size=ESP.getSketchSize();
+    if (app && image_size && image_size<=app->size) {
+        page.line("Firmware image: "+diagnostic_bytes(image_size)+" ("+String(image_size*100.0/app->size,1)+"% of app partition)");
+        page.line("Unused app partition space: "+diagnostic_bytes(app->size-image_size));
+    } else page.line("Firmware image size: unavailable");
+    page.line(String("ESP-IDF version: ")+ESP.getSdkVersion());
+
+    nvs_stats_t storage={};
+    esp_err_t result=nvs_get_stats(nullptr,&storage);
+    if (result==ESP_OK) {
+        page.line("Settings storage (NVS): "+String((unsigned)storage.used_entries)+" used, "+
+                  String((unsigned)storage.free_entries)+" free, "+String((unsigned)storage.total_entries)+" total entries");
+        page.line("NVS namespaces: "+String((unsigned)storage.namespace_count));
+    } else page.line(String("Settings storage (NVS): unavailable (")+esp_err_to_name(result)+")");
+
+    page.heading("Wi-Fi and Palm link");
+    if (WiFi.status()==WL_CONNECTED) {
+        page.line("Wi-Fi: "+WiFi.SSID()+"; signal: "+String(WiFi.RSSI())+" dBm; channel: "+String(WiFi.channel()));
+        page.line("Adapter IP: "+WiFi.localIP().toString()+"; gateway: "+WiFi.gatewayIP().toString());
+    } else page.line("Wi-Fi: not connected");
+    uint32_t palm_ip=irppp_palm_ip();
+    page.line(palm_ip ? "Palm PPP: connected, "+IPAddress(palm_ip).toString() : String("Palm PPP: disconnected"));
+    page.line("PPP output queued: "+String((unsigned)irppp_pending_output())+" B");
+    page.line("PPP bytes dropped since boot: "+String((unsigned long)irppp_dropped_bytes())+" B");
+}
+
 static void handle_diagnostics() {
+    // Take the internal byte-addressable heap snapshot before allocating the
+    // page, so rendering its status text does not inflate the displayed use.
+    multi_heap_info_t heap={};
+    heap_caps_get_info(&heap,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    const uint64_t uptime_seconds=(uint64_t)(esp_timer_get_time()/1000000);
     Page page("Diagnostics");
+    page.link("/test","Refresh readings");
+    show_esp_status(page,heap,uptime_seconds);
 
     // Which names the Palm asked for and what came of it, newest first
+    page.heading("Name lookups");
     page.line("DNS server of the Wi-Fi network: " +
               (WiFi.status() == WL_CONNECTED ? WiFi.dnsIP().toString() : String("(not connected)")));
     page.line("Recent name lookups:");
@@ -919,6 +1016,64 @@ static void handle_tasks(bool save = false) {
     String result = irtasks_last_result();
     if (result.length()) page.line("Last sync: " + result);
     page.link("/", "Back"); page.send();
+}
+
+static void handle_calendar(bool save=false) {
+    Page page("Google Calendar");
+    IrCalendarSettings settings=ircalendar_settings();
+    if (save) {
+        String id=request_arg("c"),past=request_arg("p"),future=request_arg("f");
+        id.trim(); past.trim(); future.trim();
+        bool valid=past.length() && future.length() && past.length()<=4 && future.length()<=4;
+        for (unsigned i=0;i<past.length();i++) valid=valid && isDigit(past[i]);
+        for (unsigned i=0;i<future.length();i++) valid=valid && isDigit(future[i]);
+        settings.calendar_id=id.length() ? id : String("primary");
+        settings.past_days=past.toInt(); settings.future_days=future.toInt();
+        page.line(valid && ircalendar_store_settings(settings) ? "Saved." :
+            "Could not save. Use 0-3650 past days and 1-3650 future days. A linked calendar cannot be changed.");
+        settings=ircalendar_settings();
+    }
+    const IrMailSettings &google=irmail_settings();
+    if (!google.google()) page.line("Sign in with Google first.");
+    else if (!google.google_scope(GOOGLE_CALENDAR_SCOPE)) page.line("Sign in again to allow Calendar access.");
+    else page.line("Using the Google sign-in for "+google.address+".");
+    page.line(ircalendar_ready() ? "Calendar sync: on. Disconnect Network, then tap HotSync with no desktop waiting." : "Calendar sync: off.");
+    page.line("Syncs Date Book appointments, notes, alarms and supported repeating events. Private and archived appointments stay on the Palm.");
+    page.line("Times use the Google calendar's time zone. Use primary or the calendar ID from Google Calendar settings.");
+    const Page::Field fields[]={{"c","Calendar ID",settings.calendar_id},{"p","Days before today",String(settings.past_days)},
+                               {"f","Days after today",String(settings.future_days)}};
+    page.form("/calendarsave",fields,3,"Save",true);
+    page.link(settings.enabled ? "/calendaron/0" : "/calendaron/1",settings.enabled ? "Turn Calendar off" : "Turn Calendar on");
+    page.link("/calendarcheck","Check Calendar access");
+    page.link("/calendargoogle","Sign in with Google (from a PC)");
+    page.link(settings.cyrillic ? "/calendartext/0" : "/calendartext/1",
+        settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    String last=ircalendar_last_result();
+    if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_contacts() {
+    Page page("Address Book / Google Contacts");
+    auto settings=ircontacts_settings(); const auto &google=irmail_settings();
+    if (!google.google()) page.line("Sign in with Google first.");
+    else if (!google.google_scope(GOOGLE_CONTACTS_SCOPE)) page.line("Sign in again to allow Contacts access.");
+    else if (!google.google_scope(GOOGLE_PROFILE_SCOPE)) page.line("Sign in again and allow basic profile access to identify the Contacts account.");
+    else page.line("Using the Google sign-in for "+google.address+".");
+    page.line(ircontacts_ready() ? "Contacts sync: on. Disconnect Network, then tap HotSync with no desktop waiting." : "Contacts sync: off.");
+    page.line("Syncs names, company/title, phones, email, address, notes and four Palm custom fields. Private and archived contacts stay on the Palm.");
+    page.line("Up to five phone/email values fit on the Palm; other Google values are preserved. Custom fields use Palm Custom 1 through 4 on Google.");
+    page.link(settings.enabled ? "/contactson/0" : "/contactson/1",settings.enabled ? "Turn Contacts off" : "Turn Contacts on");
+    page.link("/contactscheck","Check Contacts access");
+    page.link("/contactsgoogle","Sign in with Google (from a PC)");
+    page.link(settings.cyrillic ? "/contactstext/0" : "/contactstext/1",
+        settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    if (ircontacts_has_pending()) {
+        page.line("An unconfirmed creation is waiting. Google may take several minutes to show a new contact. Sync again first; retry only if it was never created. Retrying can duplicate it.");
+        page.link("/contactsretry","Retry unconfirmed creations");
+    }
+    String last=ircontacts_last_result(); if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
 }
 
 static void handle_mail() {
@@ -1060,8 +1215,10 @@ static void handle_mail_test() {
 
 // The Palm cannot show Google's sign-in page: open the sign-in pages to a PC on
 // the same Wi-Fi for a while, and say where to find them
-static void handle_mail_google(bool tasks = false) {
+static void handle_mail_google(bool tasks = false, bool calendar = false, bool contacts = false) {
     s_google_from_tasks = tasks;
+    s_google_from_calendar = calendar;
+    s_google_from_contacts = contacts;
     Page page("Sign in with Google");
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -1072,9 +1229,9 @@ static void handle_mail_google(bool tasks = false) {
         page.line("On a PC on the same Wi-Fi (" + WiFi.SSID() + "), open within " +
                   String((unsigned)(GOOGLE_SETUP_WINDOW_MS / 60000)) + " minutes:");
         page.line("http://" + WiFi.localIP().toString() + "/google");
-        page.line("You need your own Google OAuth client (client ID and secret): see the README, Mail, Sign in with Google.");
+        page.line("You need your own Google OAuth client (client ID and secret): see docs/google/README.md in the project.");
     }
-    page.link(tasks ? "/tasks" : "/mail", "Back");
+    page.link(contacts ? "/contacts" : calendar ? "/calendar" : tasks ? "/tasks" : "/mail", "Back");
     page.send();
 }
 
@@ -1106,9 +1263,10 @@ static void handle_pc_google() {
         page.line("Signed in as " + mail.address + ". Signing in again replaces that.");
     }
     page.line("1. In the Google Cloud console, create an OAuth client of type \"Desktop app\" "
-              "(the README, Mail, Sign in with Google, has the steps), and enter it here:");
+              "(docs/google/README.md in the project has the steps), and enter it here:");
     page.line("This sign-in requests Mail, Tasks, Contacts, Calendar, Drive, Docs, Sheets and Slides access together.");
-    page.line("Contacts, Calendar, Drive, Docs, Sheets and Slides features are planned; their permissions can be granted now.");
+    page.line("Basic profile access identifies the Google account for Contacts sync.");
+    page.line("Drive, Docs, Sheets and Slides features are planned; their permissions can be granted now.");
     page.line("Leave the client secret blank to keep the stored secret for this client ID.");
     pc_google_form(page, mail.address, mail.google_client_id);
     page.send();
@@ -1154,7 +1312,22 @@ static void handle_pc_google_done() {
         page.send();
         return;
     }
-    if (s_google_from_tasks) {
+    if (s_google_from_contacts) {
+        IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
+        auto contacts=ircontacts_settings(); contacts.enabled=mail.google_contacts();
+        if (!contacts.enabled) page.line("Google did not grant both Contacts and basic profile access. Sign in again and allow both.");
+        else page.line(ircontacts_store_settings(contacts) ? "Contacts sync is on." : "Could not enable Contacts. Enable it from the Palm's Contacts page.");
+        page.line(ircontacts_check_login());
+    } else if (s_google_from_calendar) {
+        IrMailSettings mail=irmail_settings();
+        mail.enabled=mail_was_enabled;
+        irmail_store_settings(mail);
+        IrCalendarSettings calendar=ircalendar_settings();
+        calendar.enabled=mail.google_scope(GOOGLE_CALENDAR_SCOPE);
+        if (!calendar.enabled) page.line("Google did not grant Calendar access. Sign in again and allow Calendar.");
+        else page.line(ircalendar_store_settings(calendar) ? "Calendar sync is on." : "Could not enable Calendar. Enable it from the Palm's Calendar page.");
+        page.line(ircalendar_check_login());
+    } else if (s_google_from_tasks) {
         IrMailSettings mail = irmail_settings();
         mail.enabled = mail_was_enabled;
         irmail_store_settings(mail);
@@ -1171,9 +1344,9 @@ static void handle_pc_google_done() {
         page.line("Sending: " + sending);
     }
     const IrMailSettings &google = irmail_settings();
-    const char *names[] = {"Mail", "Tasks", "Contacts", "Calendar", "Drive", "Docs", "Sheets", "Slides"};
+    const char *names[] = {"Mail", "Tasks", "Contacts", "Calendar", "Drive", "Docs", "Sheets", "Slides", "Basic profile"};
     const char *scopes[] = {GOOGLE_MAIL_SCOPE, GOOGLE_TASKS_SCOPE, GOOGLE_CONTACTS_SCOPE, GOOGLE_CALENDAR_SCOPE,
-                            GOOGLE_DRIVE_SCOPE, GOOGLE_DOCS_SCOPE, GOOGLE_SHEETS_SCOPE, GOOGLE_SLIDES_SCOPE};
+                            GOOGLE_DRIVE_SCOPE, GOOGLE_DOCS_SCOPE, GOOGLE_SHEETS_SCOPE, GOOGLE_SLIDES_SCOPE, GOOGLE_PROFILE_SCOPE};
     static_assert(sizeof(names) / sizeof(names[0]) == sizeof(scopes) / sizeof(scopes[0]), "Google permission names and scopes must match");
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         page.line(String(names[i]) + " access: " + (google.google_scope(scopes[i]) ? "granted" : "not granted"));
@@ -1734,6 +1907,31 @@ static void route_request() {
         s_proxy_all_sites = (index == 1);
         store_settings();
         handle_status();
+    }
+    else if (path == "/contacts" && !indexed) handle_contacts();
+    else if (path == "/contactscheck" && !indexed) {
+        Page page("Contacts Access"); page.line(ircontacts_check_login()); page.link("/contacts","Back"); page.send();
+    }
+    else if (path == "/contactsgoogle" && !indexed) handle_mail_google(false,false,true);
+    else if (path == "/contactsretry" && !indexed) {
+        Page page("Contacts Retry"); page.line(ircontacts_retry_pending() ? "Pending creations will be checked and retried at the next sync." : "Could not save Contacts state.");
+        page.link("/contacts","Back"); page.send();
+    }
+    else if ((path == "/contactson" || path == "/contactstext") && indexed && index>=0 && index<=1) {
+        auto settings=ircontacts_settings();
+        if (path=="/contactson") settings.enabled=index==1; else settings.cyrillic=index==1;
+        ircontacts_store_settings(settings); handle_contacts();
+    }
+    else if (path == "/calendar" && !indexed) handle_calendar();
+    else if (path == "/calendarsave" && !indexed) handle_calendar(true);
+    else if (path == "/calendarcheck" && !indexed) {
+        Page page("Calendar Access"); page.line(ircalendar_check_login()); page.link("/calendar","Back"); page.send();
+    }
+    else if (path == "/calendargoogle") handle_mail_google(false,true);
+    else if ((path == "/calendaron" || path == "/calendartext") && indexed && index>=0 && index<=1) {
+        IrCalendarSettings settings=ircalendar_settings();
+        if (path=="/calendaron") settings.enabled=index==1; else settings.cyrillic=index==1;
+        ircalendar_store_settings(settings); handle_calendar();
     }
     else if (path == "/tasks" && !indexed) handle_tasks();
     else if (path == "/taskssave" && !indexed) handle_tasks(true);

@@ -184,6 +184,20 @@
 #define TASKS_HTTP_RESPONSE_MAX    24000
 
 // ==============================================================================
+// Google Calendar (Palm Date Book, alongside Mail and Tasks)
+// ==============================================================================
+#define CALENDAR_MAX_PER_SYNC       64
+#define CALENDAR_PAST_DAYS          30
+#define CALENDAR_FUTURE_DAYS        90
+#define CALENDAR_HTTP_TIMEOUT_MS    12000
+#define CALENDAR_HTTP_RESPONSE_MAX  32000
+
+// Google Contacts (classic Palm Address Book, shared Google sign-in)
+#define CONTACTS_MAX_PER_SYNC       64
+#define CONTACTS_HTTP_TIMEOUT_MS    12000
+#define CONTACTS_HTTP_RESPONSE_MAX  32000
+
+// ==============================================================================
 // Debug Logging
 // ==============================================================================
 // Set to 1 to print a hex trace of every IrLAP frame sent / received on the
