@@ -27,6 +27,19 @@ std::string oauth_encode(const std::string &text) {
     return out;
 }
 
+bool oauth_has_scope(const std::string &granted, const std::string &scope) {
+    if (scope.empty()) return false;
+    size_t at = 0;
+    while (at < granted.size()) {
+        while (at < granted.size() && isspace((unsigned char)granted[at])) at++;
+        size_t end = at;
+        while (end < granted.size() && !isspace((unsigned char)granted[end])) end++;
+        if (granted.compare(at, end - at, scope) == 0) return true;
+        at = end;
+    }
+    return false;
+}
+
 static std::string decoded(const std::string &text) {
     std::string out;
     for (size_t i = 0; i < text.length(); i++) {
@@ -332,6 +345,7 @@ bool OAuthClient::request(const std::string &form, OAuthTokens &tokens) {
     std::string expires;
     if (code == 200 && oauth_json_field(body, "access_token", tokens.access_token) && !tokens.access_token.empty()) {
         oauth_json_field(body, "refresh_token", tokens.refresh_token);
+        oauth_json_field(body, "scope", tokens.scope);
         if (oauth_json_field(body, "expires_in", expires)) {
             tokens.expires_in = (uint32_t)strtoul(expires.c_str(), nullptr, 10);
         }

@@ -89,3 +89,27 @@ for scenario in normal bad-imap offline oauth changes; do
     fi
 done
 echo "mailsync: all passed"
+
+# Google Tasks uses ESP-IDF's bundled cJSON. Build once with pio run first,
+# or point CJSON_DIR to a cJSON source checkout for host-only testing.
+cjson=${CJSON_DIR:-${PLATFORMIO_CORE_DIR:-$HOME/.platformio}/packages/framework-espidf/components/json/cJSON}
+if [ ! -f "$cjson/cJSON.c" ]; then
+    echo "Tasks tests need cJSON: run pio run first or set CJSON_DIR." >&2
+    exit 1
+fi
+cc -O1 -g -fsanitize=address,undefined -I"$cjson" -c "$cjson/cJSON.c" -o "$out/cJSON.o"
+g++ $flags -I"$cjson" -o "$out/tasksync_test" "$here/tasksync_test.cpp" "$root/src/tasksync.cpp" \
+    "$root/src/googletasks.cpp" "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
+mkfifo "$out/tasks.tty"
+python3 "$here/fake_palm.py" --tasks --log "$out/tasks.log" --state "$out/tasks.json" \
+    > "$out/tasks.tty" 2> "$out/tasks.err" &
+palm_pid=$!
+read tty < "$out/tasks.tty"
+if ! "$out/tasksync_test" "$tty" > "$out/tasks.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/tasks.out" "$out/tasks.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/tasks.out" && grep -q '"ok": true' "$out/tasks.json"
+echo "tasksync: all passed (two-way sync, repeat syncs, pagination, field preservation, failures, deletion)"

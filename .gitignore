@@ -7,3 +7,8 @@ __pycache__/
 sdkconfig.esp32*
 # Local Wi-Fi credentials
 include/wifi_secrets.h
+
+
+# Legacy standalone Tasks credential files remain private
+include/tasks_secrets.h
+google-tasks-client*.json

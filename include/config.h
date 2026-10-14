@@ -167,12 +167,21 @@
 // Google sign-in (OAuth) instead of an app password, for Gmail. The owner
 // signs in once from a PC on the same Wi-Fi: "Sign in with Google" on the
 // Mail page opens the adapter's sign-in page to the Wi-Fi side for this long.
-// Only the mail scope for now; adding scopes later means signing in again.
-#define GOOGLE_SCOPES              "https://mail.google.com/"
+// Request all eight configured Google services together. Existing tokens
+// keep their original grants until the owner signs in again.
+#include "googlescopes.h"
+#define GOOGLE_SCOPES              GOOGLE_DEFAULT_SCOPES
 #define GOOGLE_SETUP_WINDOW_MS     (15UL * 60 * 1000)
 
 // Time server; message dates are converted to the time shown by the Palm's clock
 #define MAIL_NTP_SERVER            "pool.ntp.org"
+
+// ==============================================================================
+// Google Tasks (Palm To Do List, alongside standalone Mail)
+// ==============================================================================
+#define TASKS_MAX_PER_SYNC         100
+#define TASKS_HTTP_TIMEOUT_MS      12000
+#define TASKS_HTTP_RESPONSE_MAX    24000
 
 // ==============================================================================
 // Debug Logging

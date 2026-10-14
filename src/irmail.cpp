@@ -2,6 +2,7 @@
 #include "irdebug.h"
 #include "hotsync.h"
 #include "mailsync.h"
+#include "irtasks.h"
 #include "mailoauth.h"
 #include <WiFi.h>
 #include <Preferences.h>
@@ -46,6 +47,8 @@ static void load_settings() {
     s_settings.google_client_id = prefs.getString("gid", "");
     s_settings.google_client_secret = prefs.getString("gsecret", "");
     s_settings.google_token = prefs.getString("gtoken", "");
+    // Existing Gmail authorizations predate Tasks and only grant mail.
+    s_settings.google_scopes = prefs.getString("gscope", s_settings.google() ? "https://mail.google.com/" : "");
     prefs.end();
 }
 
@@ -68,7 +71,8 @@ void irmail_store_settings(const IrMailSettings &new_settings) {
     bool other_mailbox = settings.address != s_settings.address || settings.login != s_settings.login ||
                          settings.imap_host != s_settings.imap_host;
     if (other_mailbox && settings.google_token == s_settings.google_token) {
-        settings.google_token = ""; // The Google sign-in was for the other account
+        settings.google_token = "";
+        settings.google_scopes = ""; // The Google sign-in was for the other account
     }
     s_settings = settings;
 
@@ -85,15 +89,19 @@ void irmail_store_settings(const IrMailSettings &new_settings) {
     prefs.putString("gid", settings.google_client_id);
     prefs.putString("gsecret", settings.google_client_secret);
     prefs.putString("gtoken", settings.google_token);
+    prefs.putString("gscope", settings.google_scopes);
     prefs.end();
     if (other_mailbox) {
         irmail_forget_position();
     }
 }
 
+bool irmail_enabled() {
+    return s_settings.enabled && s_settings.address.length() > 0 && (s_settings.password.length() > 0 || s_settings.google());
+}
+
 bool irmail_ready() {
-    return s_from_palm != nullptr && s_settings.enabled && s_settings.address.length() > 0 &&
-           (s_settings.password.length() > 0 || s_settings.google());
+    return s_from_palm != nullptr && (irmail_enabled() || irtasks_ready());
 }
 
 String irmail_last_result() {
@@ -241,7 +249,7 @@ void irmail_check_login(String &receiving, String &sending) {
 }
 
 // ------------------------------------------------------------------------------
-// Google Sign-In (from a PC browser, through the portal)
+// Shared Google Sign-In (Mail and Tasks, from a PC browser)
 // ------------------------------------------------------------------------------
 
 // The sign-in in progress: what was entered, and the PKCE verifier whose
@@ -311,6 +319,7 @@ bool irmail_google_finish(const String &pasted, String &message) {
     settings.google_client_id = s_pending_client_id;
     settings.google_client_secret = s_pending_client_secret;
     settings.google_token = tokens.refresh_token.c_str();
+    settings.google_scopes = tokens.scope.empty() ? GOOGLE_SCOPES : tokens.scope.c_str();
     settings.enabled = true;
     irmail_store_settings(settings);
     message = "Signed in as " + s_pending_address + ". Mail sync is on.";
@@ -320,8 +329,29 @@ bool irmail_google_finish(const String &pasted, String &message) {
 void irmail_google_sign_out() {
     IrMailSettings settings = s_settings;
     settings.google_token = "";
+    settings.google_scopes = "";
     settings.enabled = settings.password.length() > 0;
     irmail_store_settings(settings);
+}
+
+// Reuse the same TLS transport, OAuth client and stored Google credentials
+// for Tasks. The portal uses no HotSync keep-alive; the conduit does.
+bool irmail_google_access_token(std::string &token, std::string &problem, bool keep_alive) {
+    token.clear();
+    if (!keep_alive && s_running) { problem = "A HotSync is running. Try again when it is done."; return false; }
+    if (!s_settings.google()) { problem = "Sign in with Google first."; return false; }
+    if (WiFi.status() != WL_CONNECTED) { problem = "Wi-Fi is not connected."; return false; }
+    if (!keep_alive) s_stop = false;
+    TlsConnection connection;
+    OAuthClient google(connection, keep_alive ? hotsync_keep_alive : nullptr);
+    OAuthTokens tokens;
+    if (!google.refresh(s_settings.google_client_id.c_str(), s_settings.google_client_secret.c_str(),
+                        s_settings.google_token.c_str(), tokens)) {
+        problem = google.error();
+        return false;
+    }
+    token = tokens.access_token;
+    return true;
 }
 
 // ------------------------------------------------------------------------------
@@ -458,17 +488,25 @@ static void run_sync() {
         setup.max_send = MAIL_MAX_SEND_PER_SYNC;
         setup.html_fetch_max = MAIL_HTML_FETCH_MAX;
 
-        Esp32MailHost host;
         MailSyncResult outcome;
-        mailsync_run(setup, host, outcome);
-        result = mailsync_summary(outcome).c_str();
-        if (outcome.link_lost) {
-            result += " (the link to the Palm was lost)";
-        } else {
-            // The line the user finds in the HotSync log on the Palm
-            hotsync_add_log(("Mail: " + result + "\n").c_str());
-            hotsync_end(0);
+        if (irmail_enabled()) {
+            Esp32MailHost host;
+            mailsync_run(setup, host, outcome);
         }
+        result = irmail_enabled() ? String(mailsync_summary(outcome).c_str()) : String("");
+        bool lost = outcome.link_lost;
+        if (irmail_enabled() && !lost) hotsync_add_log(("Mail: " + result + "\n").c_str());
+        if (!lost && irtasks_ready()) {
+            TaskSyncResult tasks;
+            irtasks_sync(tasks);
+            String summary = tasksync_summary(tasks).c_str();
+            if (!tasks.link_lost) hotsync_add_log(("Tasks: " + summary + "\n").c_str());
+            lost = tasks.link_lost;
+            if (result.length()) result += "; ";
+            result += "Tasks: " + summary;
+        }
+        if (lost) result += " (the link to the Palm was lost)";
+        else hotsync_end(0);
     }
     irdbg_printf("Mail: %s", result.c_str());
     strlcpy(s_last_result, result.c_str(), sizeof(s_last_result));
@@ -490,6 +528,7 @@ void irmail_init() {
         return;
     }
     load_settings();
+    irtasks_init();
     s_from_palm = xStreamBufferCreate(MAIL_STREAM_SIZE, 1);
     s_to_palm = xStreamBufferCreate(MAIL_STREAM_SIZE, 1);
     if (s_from_palm == nullptr || s_to_palm == nullptr) {

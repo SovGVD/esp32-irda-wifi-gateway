@@ -1,9 +1,10 @@
-# ESP32-C3 IrDA Adapter for the Palm IIIx: HotSync over USB, Internet and Mail over Wi-Fi
+# ESP32-C3 IrDA Adapter for the Palm IIIx: HotSync over USB, Internet, Mail and Google Tasks over Wi-Fi
 
-This project turns an **ESP32-C3** paired with a **Vishay TFBS4711** infrared transceiver into an **IrDA adapter** for vintage IrDA devices like the **Palm IIIx**. One firmware does three jobs:
+This project turns an **ESP32-C3** paired with a **Vishay TFBS4711** infrared transceiver into an **IrDA adapter** for vintage IrDA devices like the **Palm IIIx**. One firmware does four jobs:
 
 - **HotSync with a modern Linux computer.** The adapter shows up as a USB serial port, and `pilot-link` / `jpilot` talk to the Palm through it as if it sat in a serial cradle.
 - **Internet access for the Palm.** The adapter answers the Palm's network connection itself and routes it onto Wi-Fi. The Wi-Fi network is chosen from a small web portal opened on the Palm.
+- **Google Tasks in the Palm's To Do List.** Standalone HotSync synchronises one Google task list in both directions, including completion, notes, due dates and deletions. It can run independently of Mail.
 - **E-mail in the Palm's Mail application.** When a HotSync finds no computer, the adapter performs it itself and exchanges the Mail application's messages with a mail account (IMAP / SMTP, for example Gmail) over Wi-Fi.
 
 ```
@@ -325,7 +326,7 @@ The adapter logs in to Gmail with Google's own sign-in (OAuth, SASL XOAUTH2) ins
 
 **A. Create the OAuth client** (once, at [console.cloud.google.com](https://console.cloud.google.com/), signed in with any Google account):
 1. Create a project (top bar → project list → New project), for example "Palm mail".
-2. APIs & Services → Library → **Gmail API** → Enable.
+2. APIs & Services → Library → enable **Gmail API**, **Google Tasks API**, **People API** (Contacts), **Google Calendar API**, **Google Drive API**, **Google Docs API**, **Google Sheets API** and **Google Slides API**.
 3. Google Auth Platform (or "OAuth consent screen") → Get started: an app name, your e-mail address as support and contact address, Audience **External**.
 4. Audience → **Publish app**, so that its status is **In production**. Leave it unverified. In "Testing" status Google ends the sign-in after 7 days.
 5. Clients → Create client → Application type **Desktop app** → Create. Keep the **Client ID** and **Client secret** it shows.
@@ -338,10 +339,31 @@ The adapter logs in to Gmail with Google's own sign-in (OAuth, SASL XOAUTH2) ins
 5. The page then logs in to both servers and shows the outcome. Mail sync is on; tap HotSync on the Palm.
 
 **Notes:**
+- The shared sign-in requests Mail, Tasks, Contacts, Calendar, Drive, Docs, Sheets and Slides permissions together. Enable the corresponding APIs in the same Cloud project and add these scopes under Google Auth Platform → Data Access. Grant all eight services on the consent page to prepare the refresh token for their future integrations.
+- Mail and Tasks sync are implemented. Contacts, Calendar, Drive, Docs, Sheets and Slides authorization is prepared for future features; granting permission does not start a sync for those services.
 - The adapter keeps the "refresh token" Google gives it, and gets a fresh access token from Google at the start of each sync. The token, client ID and secret are stored unencrypted in the ESP32's flash, like the Wi-Fi passwords. The token gives full access to the mailbox (IMAP and SMTP accept no narrower permission).
 - Google ends a sign-in when the account's password is changed, when access is removed (Google account → Security → Your connections to third-party apps), when it has not been used for six months, or after 7 days if the app is still in "Testing". The HotSync log then says `Google sign-in no longer valid, sign in again from a PC`: repeat step B.
 - **Sign out of Google** on the Mail page makes the adapter forget the token; the account's own security page removes the access on Google's side.
 - Changing the e-mail address on the Palm ends the Google sign-in (it belonged to the other account).
+
+### Shared Google permissions
+
+The next sign-in requests the following read/write permissions in one consent. The completion page shows which permissions Google actually granted, and future clients can check each exact scope through the shared settings.
+
+| Service | Scope | Access |
+|:--------|:------|:-------|
+| Mail | `https://mail.google.com/` | Gmail IMAP/SMTP |
+| Tasks | `https://www.googleapis.com/auth/tasks` | Read and change task lists and tasks |
+| Contacts | `https://www.googleapis.com/auth/contacts` | Read and change personal contacts through People API |
+| Calendar | `https://www.googleapis.com/auth/calendar` | Read and manage calendars and events |
+| Drive | `https://www.googleapis.com/auth/drive` | Read and manage all Drive files |
+| Docs | `https://www.googleapis.com/auth/documents` | Read and edit Google Docs documents |
+| Sheets | `https://www.googleapis.com/auth/spreadsheets` | Read and edit Google Sheets spreadsheets |
+| Slides | `https://www.googleapis.com/auth/presentations` | Read and edit Google Slides presentations |
+
+These scopes cover the named services' planned read/write integrations. Drive uses full-file access so a future browser or sync client can work with existing files; `drive.file` would cover only files created or selected for this app. Special APIs such as Workspace Directory or Drive app-data may require separate scopes if added later.
+
+Google documents these permissions in the [People API scope list](https://developers.google.com/identity/protocols/oauth2/scopes#people), [Calendar scope guide](https://developers.google.com/workspace/calendar/api/auth), [Drive scope guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth), [Docs scope guide](https://developers.google.com/workspace/docs/api/auth), [Sheets scope guide](https://developers.google.com/workspace/sheets/api/scopes) and [Slides scope guide](https://developers.google.com/workspace/slides/api/scopes).
 
 ### 2. Synchronise
 In the **HotSync** application choose "IR to a PC/Handheld" and tap the HotSync icon, exactly as for a desktop sync.
@@ -369,6 +391,49 @@ The outcome is written to the **HotSync log** on the Palm (HotSync → Log), for
 - Keep the IR ports aligned until the Palm reports that the HotSync is complete.
 - "Fetch the newest messages again" on the Mail page makes the next sync start over, for example after emptying the Palm's Inbox.
 - To sync with a computer while mail is set up, start `pilot-xfer` / `jpilot` **before** tapping HotSync, or turn mail sync off on the Mail page.
+
+---
+
+## Google Tasks on the Palm
+
+The adapter synchronises the Palm's built-in **To Do List** (`ToDoDB`) with **one Google task list** during standalone HotSync. Mail and Tasks have separate switches; either or both can run. A desktop listening on USB still takes priority.
+
+> [!NOTE]
+> Google Tasks support has been checked against a simulated Palm and an in-memory Google API, and the ESP32 firmware builds. Real Google authorization, TLS requests on the board, flash persistence across restarts and a real Palm sync still need hardware testing.
+
+### 1. Use the existing Google sign-in
+
+Tasks shares the adapter's **Sign in with Google** flow with Mail: the same Desktop OAuth client, portal pages, PKCE exchange, NVS refresh token and token-refresh client. No separate script or credential header is needed.
+
+1. Enable **Google Tasks API** in the Google Cloud project that owns your existing OAuth client.
+2. On the Palm, open **Google Tasks** at `http://wifi.setup/` and choose **Sign in with Google (from a PC)**. This opens the existing `/google` setup page on the Wi-Fi side for 15 minutes.
+3. On a PC on the same Wi-Fi, open the address shown on the Palm. The form reuses the stored Google account and client ID; leave the secret blank to keep the stored secret for that client.
+4. Continue to Google's consent page and allow **Mail, Tasks, Contacts, Calendar, Drive, Docs, Sheets and Slides** access. Copy the loopback address Google redirects to and paste it into the adapter's page, as described under **Mail → Sign in with Google**.
+5. Finishing from the Tasks page enables Tasks and preserves Mail's previous on/off setting. You can also turn Tasks on or off separately on the Palm.
+
+**Existing authorizations must sign in again once to grant the expanded permissions:** firmware changes cannot extend an already-issued token. Once all eight permissions are granted, future Contacts, Calendar, Drive, Docs, Sheets and Slides features can use the same refresh token for operations covered by those scopes. Token expiry, revocation or additional scopes can still require another sign-in. Until Tasks permission has been granted, the Tasks page explains that reauthorization is needed; Mail can continue using its existing token.
+
+The default list is `@default`. To use another list, enter its Google API ID (not its displayed name) on the Tasks page. A dedicated Google task list makes the first sync easier to review. Existing public Palm tasks are uploaded, and existing Google tasks are added to the Palm; matching titles are not treated as the same task.
+
+### 2. Check access and sync
+
+Choose **Check Google access** while Network is connected. Disconnect Network, align the infrared ports, and tap HotSync with no desktop waiting. The Palm HotSync log and portal show an outcome such as `Tasks: 1 uploaded, 2 downloaded, 0 deleted`.
+
+Google credentials stay in the existing `irmail` NVS namespace (`gid`, `gsecret`, `gtoken`); Tasks stores only its switch, character set, list and mapping state in `irtasks`. Signing out of Google also stops Tasks until another shared sign-in. To replace an expired token, repeat the existing portal sign-in.
+
+### Sync behavior and limits
+
+- Titles, notes, completion and due **dates** sync in both directions. On simultaneous edits, the Palm wins for each field edited since its last successful sync; other fields take Google's current values.
+- Task IDs and per-field baselines are saved in flash. Repeated successful syncs update the same records.
+- Explicit Palm deletion deletes the linked Google task. Google deletion removes its linked Palm record. A full paginated snapshot is required before any changes; a failed page never implies deletion.
+- Private and archived Palm records are skipped. Palm priority and category stay on the Palm. Google subtasks appear as flat Palm tasks; their Google hierarchy and links are preserved. Assigned tasks are excluded.
+- Imported descriptions are limited to 255 Palm bytes and notes to 4095. Text uses Windows-1252 or the separate Cyrillic setting. Unsupported characters are approximated or omitted. Unedited long or unrepresentable Google fields are preserved when other fields change.
+- Palm due years are 1904–2031. Dates outside that range appear undated; they stay intact on Google unless the Palm due-date field changes. The [Tasks API](https://developers.google.com/workspace/tasks/reference/rest/v1/tasks) exposes date information only.
+- A snapshot accepts up to 100 records on each side (including Google deletion tombstones), with a 48 KB text budget per side and 24 KB maximum HTTPS response per page. These bounds protect memory; exceeding a limit reports a problem.
+- Use one Palm and one Google list per adapter. The first sync binds the canonical Google list ID and Palm HotSync user ID; a mismatch stops syncing. Palms without a HotSync user ID cannot be distinguished. Changing the configured task list after linking records is refused. The shared Google sign-in can be renewed; a different account/list ID will be refused by the saved mapping binding.
+- Credentials and mappings are stored unencrypted in flash, like Wi-Fi and mail settings. HTTPS certificates are checked. Network failures preserve pending Palm edits. Power loss or an ambiguous failure during creation before an ID is saved can leave a duplicate on retry; cross-device sync is not atomic.
+
+See Google's [desktop OAuth guide](https://developers.google.com/identity/protocols/oauth2/native-app) and [device-flow scopes](https://developers.google.com/identity/protocols/oauth2/limited-input-device#allowedscopes).
 
 ---
 
@@ -400,13 +465,15 @@ All settings are in `include/config.h`.
 | `PROXY_MAX_PAGE_BYTES` | 48000 | Longer pages are cut off |
 | `XIINO_DATASERVER_HOST` | `pds.mobirus.com` | Name under which the adapter stands in for Xiino's DataServer |
 | `PPP_GATEWAY_IP` / `PPP_PALM_IP` | `192.168.99.1` / `.2` | Addresses on the link between adapter and Palm |
-| `MAIL_PC_ANSWER_TIMEOUT_MS` | 1500 | How long a HotSync waits for a desktop on USB before it becomes a mail sync |
+| `MAIL_PC_ANSWER_TIMEOUT_MS` | 1500 | How long a HotSync waits for a desktop on USB before standalone Mail / Tasks sync |
 | `MAIL_DEFAULT_IMAP_SERVER` / `MAIL_DEFAULT_SMTP_SERVER` | Gmail's | Mail servers until others are entered in the portal |
 | `MAIL_MAX_PER_SYNC` / `MAIL_MAX_SEND_PER_SYNC` | 15 / 10 | Newest inbox messages looked at, and Outbox messages sent, per sync |
 | `MAIL_HTML_FETCH_MAX` | 96000 | Bytes read of a message that only exists as HTML |
-| `GOOGLE_SCOPES` | `https://mail.google.com/` | Access asked for when signing in with Google |
+| `GOOGLE_SCOPES` | Mail + Tasks + Contacts + Calendar + Drive + Docs + Sheets + Slides | Access asked for by the shared Google sign-in |
 | `GOOGLE_SETUP_WINDOW_MS` | 15 minutes | How long the sign-in page answers on the Wi-Fi side once opened from the Palm |
 | `MAIL_NTP_SERVER` | `pool.ntp.org` | Time server (for message dates) |
+| `TASKS_MAX_PER_SYNC` | 100 | Maximum Palm records and Google tasks in a snapshot |
+| `TASKS_HTTP_TIMEOUT_MS` / `TASKS_HTTP_RESPONSE_MAX` | 12000 / 24000 | HTTPS timeout and response byte limit |
 | `ENABLE_CDC_DEBUG` | 0 | Print a protocol trace on USB instead of serial data |
 | `CURRENT_OP_MODE` | `MODE_IRCOMM` | `MODE_RAW_SIR` turns the adapter into a plain IR pulse bridge without the IrDA stack |
 
@@ -449,7 +516,7 @@ All settings are in `include/config.h`.
 
 ## Host-Side Tests
 
-The parts that do not need the ESP32 can be tried on a computer (needs `g++` and `python3`):
+The parts that do not need the ESP32 can be tried on a computer (needs `g++`, a C compiler and `python3`). Tasks tests use cJSON installed by PlatformIO after the first build; set `CJSON_DIR` to another cJSON source directory for host-only testing:
 
 ```bash
 test/host/run.sh
@@ -460,6 +527,7 @@ test/host/run.sh
 - **IMAP and SMTP clients:** against scripted servers that answer as Gmail does, with the answers arriving whole and one byte at a time; with passwords and with Google sign-in (XOAUTH2).
 - **Google sign-in:** the consent address, the PKCE challenge (RFC 7636 example), taking the code from a pasted address, and the token server's answers (tokens, revoked token, wrong client).
 - **Whole mail syncs:** the conduit between the simulated Palm and the scripted servers, with a password, with Google sign-in, and with messages read, deleted, filed and archived on either side; what the Palm holds afterwards is compared with the expected contents.
+- **Google Tasks:** two-way and repeated HotSyncs against the simulated ToDoDB and an in-memory Google API, pagination, completion, due-date clearing, long-field preservation, conflicts, private/archive exclusion, deletion and failure handling. Tasks authorization also exercises the existing OAuthClient with a scripted token server.
 
 ---
 
@@ -473,6 +541,7 @@ irda-esp32/
 ├── CMakeLists.txt         # ESP-IDF project file used by the PlatformIO build
 ├── include/
 │   ├── config.h           # Pin assignments, baud rates, Wi-Fi gateway and debug settings
+│   ├── googlescopes.h     # Shared Google scope definitions, including planned services
 │   ├── ringbuffer.h       # Circular FIFO for serial stream bridging
 │   ├── irphy.h            # Physical layer (ESP32-C3 UART1 IrDA driver)
 │   ├── irlap.h            # IrLAP link protocol (framing, CRC16 FCS, discovery)
@@ -483,6 +552,9 @@ irda-esp32/
 │   ├── irportal.h         # Wi-Fi settings portal
 │   ├── irmail.h           # Mail: HotSync sessions served by the adapter itself
 │   ├── hotsync.h          # HotSync from the desktop's side (SLP, PADP, CMP, DLP)
+│   ├── irtasks.h          # Tasks settings and ESP32 conduit adapter
+│   ├── tasksync.h         # Two-way Palm To Do List conduit
+│   ├── googletasks.h      # Google Tasks REST client
 │   ├── mailsync.h         # The mail conduit (Outbox to SMTP, IMAP inbox to Inbox)
 │   ├── mailnet.h          # IMAP and SMTP clients
 │   ├── mailoauth.h        # Google sign-in (OAuth tokens, XOAUTH2)
@@ -497,12 +569,15 @@ irda-esp32/
 │   ├── irportal.cpp       # Wi-Fi manager, web portal (HTML / WML), web proxy and DNS for the Palm
 │   ├── irmail.cpp         # Mail settings, conduit task, TLS connection to the mail servers
 │   ├── hotsync.cpp        # HotSync protocols, as pilot-link speaks them
+│   ├── irtasks.cpp        # Tasks NVS state, HTTPS and portal settings
+│   ├── tasksync.cpp       # ToDoDB conversion and synchronization
+│   ├── googletasks.cpp    # Google API requests
 │   ├── mailsync.cpp       # Steps of a mail sync
 │   ├── mailnet.cpp        # IMAP and SMTP
 │   ├── mailoauth.cpp      # Google's token server, consent address, PKCE
 │   ├── mailtext.cpp       # Conversion between Mail records and Internet mail
 │   ├── irdebug.cpp        # Protocol trace buffer
-│   └── main.cpp           # IrLAP state machine; routes each session to USB, Wi-Fi or mail
+│   └── main.cpp           # IrLAP state machine; routes sessions to USB, Wi-Fi or conduits
 ├── test/host/             # Tests that run on a computer (see "Host-Side Tests")
 └── udev/
     └── 99-esp32-irda.rules# Linux udev rules (disables ModemManager probing)

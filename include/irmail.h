@@ -1,12 +1,13 @@
 #pragma once
 
 #include <Arduino.h>
+#include <string>
 #include "config.h"
+#include "mailoauth.h"
 
-// Mail conduit: when the Palm starts a HotSync and no desktop takes it, the
-// adapter answers it itself and synchronises the Palm's Mail application with
-// a mail account over Wi-Fi (Outbox to SMTP, the newest IMAP inbox messages to
-// the Inbox). Set up from the portal.
+// Standalone HotSync session: when no desktop answers, the adapter runs the
+// enabled Mail and Google Tasks conduits over Wi-Fi. Settings are independent
+// and entered in the portal. Mail uses IMAP/SMTP; Tasks uses Google OAuth.
 
 struct IrMailSettings {
     bool enabled = false;
@@ -22,6 +23,9 @@ struct IrMailSettings {
     String google_client_id;
     String google_client_secret;
     String google_token;
+    String google_scopes;
+    bool google_scope(const char *scope) const { return google() && oauth_has_scope(google_scopes.c_str(), scope); }
+    bool google_tasks() const { return google_scope(GOOGLE_TASKS_SCOPE); }
     bool google() const { return google_token.length() > 0; }
 };
 
@@ -31,7 +35,8 @@ void irmail_init();
 const IrMailSettings &irmail_settings();
 void irmail_store_settings(const IrMailSettings &settings);
 void irmail_forget_position();  // The next sync fetches the newest messages again
-bool irmail_ready();            // Switched on, with an account to use
+bool irmail_enabled();          // Mail account configured and enabled
+bool irmail_ready();            // Standalone session available for Mail or Tasks
 String irmail_last_result();    // Outcome of the last sync, for the portal
 // Tries to log in to both servers; one line of text for each
 void irmail_check_login(String &receiving, String &sending);
@@ -44,6 +49,8 @@ void irmail_check_login(String &receiving, String &sending);
 String irmail_google_begin(const String &address, const String &client_id, const String &client_secret);
 bool irmail_google_finish(const String &pasted, String &message);
 void irmail_google_sign_out();
+// Shared token refresh used by the Tasks conduit and its login check.
+bool irmail_google_access_token(std::string &token, std::string &problem, bool keep_alive = false);
 
 // A HotSync session handled by the conduit. `opening` is what the Palm sent
 // before the session was handed over. Returns false while an earlier sync is

@@ -168,3 +168,9 @@ std::string mail_compose(const MailMessage &msg, const MailIdentity &sender, Pal
                          const std::string &message_id);
 
 std::string mail_base64(const std::string &data);
+
+// Plain Palm text to UTF-8, shared by the Tasks conduit.
+std::string palm_to_utf8(const std::string &text, PalmCharset charset);
+
+// Convert plain UTF-8 without mail whitespace normalization.
+std::string palm_from_utf8(const std::string &text, PalmCharset charset, size_t max_chars);
