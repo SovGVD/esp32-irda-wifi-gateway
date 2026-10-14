@@ -49,7 +49,7 @@ test/host/run.sh
 
 ## Validation status
 
-The project has been used with a Palm IIIx and Xiino for desktop backup/install, PPP, the portal and Wi-Fi setup. Mail, Google Tasks and Calendar are reported working on the user's device after the shared HTTPS fixes. Contacts access is confirmed after adding profile permission, but actual Contacts transfers stopped on a Palm record-decoding error. The decoder compatibility fix needs a device retest. The shared HTTPS and OAuth changes passed the firmware build and sanitizer-enabled host tests.
+The project has been used with a Palm IIIx and Xiino for desktop backup/install, PPP, the portal and Wi-Fi setup. Mail, Google Tasks and Calendar are reported working on the user's device after the shared HTTPS fixes. The user confirmed Contacts sync working after the profile-permission and record-decoder fixes on 14 October 2026. The firmware build and sanitizer-enabled host tests passed for these changes.
 
 That device report covers normal use; restart persistence, interrupted writes, larger data sets and uncommon recurrence/conflict cases have not each been separately confirmed on hardware. The web proxy's recorded verification is host-side testing. Keep automated test coverage separate from those device checks.
 
