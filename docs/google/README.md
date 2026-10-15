@@ -2,7 +2,7 @@
 
 [Documentation](../README.md)
 
-Mail, Tasks, Calendar and Contacts reuse one Google OAuth client and refresh token. Their sync switches are independent. Drive, Docs, Sheets and Slides permissions are requested now for future integrations; those sync features are not implemented.
+Mail, Tasks, Calendar, Contacts, Memo Pad, Note Pad, Expenses and Drive reuse one Google OAuth client and refresh token. Their sync switches are independent. Slides permission is prepared for future integrations; Slides sync is not implemented.
 
 | Palm application | Google service | Guide |
 |:-----------------|:---------------|:------|
@@ -10,6 +10,10 @@ Mail, Tasks, Calendar and Contacts reuse one Google OAuth client and refresh tok
 | To Do List | Google Tasks | [Tasks](tasks.md) |
 | Date Book | Google Calendar | [Calendar](calendar.md) |
 | Address Book | Google Contacts / People API | [Contacts](contacts.md) |
+| Memo Pad | Google Docs | [Memos](memos.md) |
+| Note Pad (Palm OS 4 drawings) | PNG files in Google Drive | [Notes](notes.md) |
+| Expense | Google Sheets | [Expenses](expenses.md) |
+| Full backup, install and restore | Google Drive | [Drive](drive.md) |
 
 ## Shared Google sign-in
 
@@ -35,7 +39,7 @@ The adapter logs in to Gmail with Google's own sign-in (OAuth, SASL XOAUTH2) ins
 **Notes:**
 
 - The shared sign-in requests Mail, Tasks, Contacts, Calendar, Drive, Docs, Sheets and Slides permissions together, plus basic profile permission for the Contacts account identity check. Enable the corresponding APIs in the same Cloud project and add the [listed scopes](#shared-google-permissions) in Google Auth Platform → Data Access. Grant all requested permissions on the consent page to prepare the refresh token for their future integrations.
-- Mail, Tasks, Calendar and Contacts sync are implemented. Drive, Docs, Sheets and Slides authorization is prepared for future features; granting permission does not start a sync for those services.
+- Mail, Tasks, Calendar, Contacts, Memo Pad, Note Pad, Expenses and Drive sync are implemented. Expenses uses Sheets; Slides authorization is prepared for future features. Granting permission does not enable individual conduits.
 - The adapter keeps the "refresh token" Google gives it, and gets a fresh access token from Google at the start of each sync. The token, client ID and secret are stored unencrypted in the ESP32's flash, like the Wi-Fi passwords. The token gives full access to the mailbox (IMAP and SMTP accept no narrower permission).
 - Google ends a sign-in when the account's password is changed, when access is removed (Google account → Security → Your connections to third-party apps), when it has not been used for six months, or after 7 days if the app is still in "Testing". The HotSync log then says `Google sign-in no longer valid, sign in again from a PC`: repeat step B.
 - **Sign out of Google** on the Mail page makes the adapter forget the token; the account's own security page removes the access on Google's side.
@@ -57,7 +61,7 @@ The next sign-in requests the following read/write permissions in one consent. T
 | Sheets | `https://www.googleapis.com/auth/spreadsheets` | Read and edit Google Sheets spreadsheets |
 | Slides | `https://www.googleapis.com/auth/presentations` | Read and edit Google Slides presentations |
 
-These scopes cover the named services' planned read/write integrations. Drive uses full-file access so a future browser or sync client can work with existing files; `drive.file` would cover only files created or selected for this app. Special APIs such as Workspace Directory or Drive app-data may require separate scopes if added later.
+These scopes cover the named services' planned read/write integrations. Drive uses full-file access so backup/restore can work with existing uploaded files; `drive.file` would cover only files created or selected for this app. Special APIs such as Workspace Directory or Drive app-data may require separate scopes if added later.
 
 Google documents these permissions in the [People API scope list](https://developers.google.com/identity/protocols/oauth2/scopes#people), [Calendar scope guide](https://developers.google.com/workspace/calendar/api/auth), [Drive scope guide](https://developers.google.com/workspace/drive/api/guides/api-specific-auth), [Docs scope guide](https://developers.google.com/workspace/docs/api/auth), [Sheets scope guide](https://developers.google.com/workspace/sheets/api/scopes) and [Slides scope guide](https://developers.google.com/workspace/slides/api/scopes).
 

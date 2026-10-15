@@ -1,9 +1,14 @@
 #include "irportal.h"
 #include "irppp.h"
 #include "irmail.h"
+#include "irsyncdiag.h"
 #include "irtasks.h"
 #include "ircalendar.h"
 #include "ircontacts.h"
+#include "irdrive.h"
+#include "irnotes.h"
+#include "irexpenses.h"
+#include "irhotsync.h"
 #include "irdebug.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -84,6 +89,9 @@ static uint32_t s_google_window_since = 0;
 static bool s_google_from_tasks = false;
 static bool s_google_from_calendar = false;
 static bool s_google_from_contacts = false;
+static bool s_google_from_drive = false;
+static int s_google_from_notes = -1;
+static bool s_google_from_expenses = false;
 
 // Web proxy for all sites (see the proxy section); switched from the status page
 static bool s_proxy_all_sites = PROXY_ALL_SITES_DEFAULT;
@@ -718,6 +726,11 @@ static void handle_status() {
     page.link("/calendar", ircalendar_ready() ? "Google Calendar: on" : "Google Calendar: off");
     page.link("/contacts", ircontacts_ready() ? "Address Book: on" : "Address Book: off");
     page.link("/tasks", irtasks_ready() ? "Google Tasks: on" : "Google Tasks: off");
+    page.link("/memos",irnotes_ready(false) ? "Memo Pad: on" : "Memo Pad: off");
+    page.link("/notes",irnotes_ready(true) ? "Note Pad: on" : "Note Pad: off");
+    page.link("/expenses",irexpenses_ready() ? "Expenses: on" : "Expenses: off");
+    page.link("/drive", irdrive_ready() ? "Drive backup: on" : "Drive backup: off");
+    page.link("/hotsync","HotSync settings (user name)");
 
     page.link("/", "Refresh");
     page.link("/nets", "Add Wi-Fi network");
@@ -883,6 +896,24 @@ static void show_esp_status(Page &page,const multi_heap_info_t &heap,uint64_t up
     page.line("PPP bytes dropped since boot: "+String((unsigned long)irppp_dropped_bytes())+" B");
 }
 
+static void show_sync_diagnostics(Page &page,bool previous) {
+    SyncDiagnosticState state;
+    if (!irsyncdiag_snapshot(state,previous)) return;
+    page.heading(previous ? "Previous HotSync diagnostics (retained across reboot)" : "HotSync diagnostics since boot");
+    page.line(String("State: ")+(state.active ? (previous ? "interrupted" : "in progress") : state.failed ? "failed" : "idle/completed"));
+    if (state.service[0]) page.line(String("Last service: ")+state.service);
+    if (state.outcome[0]) page.line(String("Result: ")+state.outcome);
+    if (state.allocation_size) {
+        page.line("Failed allocation: "+diagnostic_bytes(state.allocation_size)+"; function: "+state.allocation_function+
+                  "; capabilities: "+String(state.allocation_caps,HEX));
+    }
+    for (unsigned n=0;n<state.count;n++) {
+        const auto &e=state.events[(state.next+8-state.count+n)%8];
+        page.line(String(e.uptime_ms)+" ms: "+e.stage+"; free heap "+String(e.free_heap)+
+                  " B; largest block "+String(e.largest_block)+" B; task stack headroom "+String(e.stack_free)+" B");
+    }
+}
+
 static void handle_diagnostics() {
     // Take the internal byte-addressable heap snapshot before allocating the
     // page, so rendering its status text does not inflate the displayed use.
@@ -892,6 +923,8 @@ static void handle_diagnostics() {
     Page page("Diagnostics");
     page.link("/test","Refresh readings");
     show_esp_status(page,heap,uptime_seconds);
+    show_sync_diagnostics(page,false);
+    show_sync_diagnostics(page,true);
 
     // Which names the Palm asked for and what came of it, newest first
     page.heading("Name lookups");
@@ -1050,6 +1083,96 @@ static void handle_calendar(bool save=false) {
         settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
     String last=ircalendar_last_result();
     if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_hotsync(bool save=false) {
+    Page page("HotSync Settings"); auto settings=irhotsync_settings();
+    if (save) {
+        settings.username=request_arg("u"); settings.username.trim(); String problem;
+        page.line(irhotsync_store_settings(settings,problem) ? "Saved. The name will be applied at the next standalone HotSync if the Palm has no name." : problem);
+        settings=irhotsync_settings();
+    }
+    page.line("One HotSync user name for Memo Pad, Note Pad, Expenses and Drive backup. Enter the name here, disconnect Network, then tap HotSync with no desktop waiting.");
+    page.line("An existing Palm name is used as-is. The Palm's numeric user identity and existing sync links are preserved. Use the original name when recovering existing backups.");
+    const Page::Field fields[]={{"u","HotSync user name (for an unnamed Palm)",settings.username}};
+    page.form("/hotsyncsave",fields,1,"Save",true);
+    page.line("Up to 40 Palm characters. Leave empty to keep automatic setup off.");
+    page.link(settings.cyrillic ? "/hotsynctext/0" : "/hotsynctext/1",settings.cyrillic ? "Name text: Cyrillic. Switch to Western" : "Name text: Western. Switch to Cyrillic");
+    String last=irhotsync_last_result(); if (last.length()) page.line("Last HotSync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_notes(bool drawing) {
+    Page page(drawing ? "Note Pad / Google Drive" : "Memo Pad / Google Docs");
+    const auto &settings=irnotes_settings(drawing);
+    String base=drawing ? "/notes" : "/memos";
+    page.line(irnotes_ready(drawing) ? "Sync is on. Disconnect Network, then tap HotSync with no desktop waiting." : "Sync is off. Allow the required Google permissions, then enable it.");
+    page.line("Folder: "+irnotes_folder(drawing));
+    page.link("/hotsync","HotSync user settings");
+    page.line(drawing ? "Two-way sync of standard Palm OS 4 Note Pad drawings and PNG files. Titles are file names. Scrolling canvases are supported. PNG imports up to 160 pixels wide are converted to black and white; Palm alarms and categories stay on Palm." :
+        "Two-way sync of classic Memo Pad text and Google Docs. One document per memo; the full memo is its body. Private and archived records are excluded.");
+    page.line("Deleting a linked note on either side deletes its counterpart. Google files are moved to Trash. Moving a file out of this folder pauses its sync.");
+    page.link(base+"on/"+(settings.enabled ? "0" : "1"),settings.enabled ? "Turn sync off" : "Turn sync on");
+    page.link(base+"check","Check Google access");
+    page.link(base+"google","Sign in with Google (from a PC)");
+    page.link(base+"text/"+(settings.cyrillic ? "0" : "1"),settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    const char *policies[]={"Stop for review","Prefer Palm edits","Prefer Google edits"};
+    page.line(String("Conflicts: ")+policies[settings.conflicts<=2 ? settings.conflicts : 0]);
+    for (unsigned i=0;i<3;i++) if (i!=settings.conflicts) page.link(base+"conflict/"+String(i),policies[i]);
+    if (!drawing) {
+        page.line("If a Google document creation is unconfirmed, check for it in Drive and retry HotSync first. An explicit retry before Google finishes propagating can create a duplicate.");
+        page.link(base+"retry","Retry unconfirmed creations");
+    }
+    String last=irnotes_last_result(drawing); if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_expenses() {
+    Page page("Expenses / Google Sheets"); const auto &s=irexpenses_settings();
+    page.line(irexpenses_ready() ? "Sync is on. Disconnect Network, then tap HotSync with no desktop waiting." : "Sync is off. Allow Drive and Sheets access, then enable it.");
+    page.line("Two-way sync of classic Palm Expense records, including date, type, payment, currency, amount, vendor, city, attendees, note and category.");
+    page.line("First HotSync creates Palm/<HotSync user name>/Expenses in Google Drive. Open the spreadsheet from a PC to edit or add expenses.");
+    String url=irexpenses_sheet_url(); if (url.length()) page.link_new_window(url,"Open Expenses spreadsheet (from a PC)");
+    page.link("/hotsync","HotSync user settings");
+    page.line("Leave Record ID empty for new rows; keep linked IDs and headers unchanged. Use YYYY-MM-DD dates and plain-text amounts. Use currencies such as NZD ($), USD ($) or EUR; existing Palm currency codes are also accepted. Category is its 0-15 slot.");
+    page.line("Set Deleted to TRUE to remove an expense from Palm; deleting on Palm marks its linked row TRUE. Keep other expense cells as plain text. Private and archived Palm records are excluded.");
+    page.line("Finish editing the spreadsheet before HotSync. Stop for review is the default when the same field changes on both sides.");
+    page.link(s.enabled ? "/expenseson/0" : "/expenseson/1",s.enabled ? "Turn Expenses off" : "Turn Expenses on");
+    page.link("/expensescheck","Check Google access"); page.link("/expensesgoogle","Sign in with Google (from a PC)");
+    page.link(s.cyrillic ? "/expensestext/0" : "/expensestext/1",s.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    const char *policies[]={"Stop for review","Prefer Palm edits","Prefer Google edits"};
+    page.line(String("Conflicts: ")+policies[s.conflicts<=2 ? s.conflicts : 0]);
+    for (unsigned i=0;i<3;i++) if (i!=s.conflicts) page.link("/expensesconflict/"+String(i),policies[i]);
+    page.line("If a creation is unconfirmed, check Drive and the spreadsheet, then retry HotSync first. Explicit retry can duplicate an operation Google has not yet made visible.");
+    page.link("/expensesretry","Retry unconfirmed creations");
+    String last=irexpenses_last_result(); if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_drive() {
+    Page page("Google Drive Backup");
+    auto settings=irdrive_settings();
+    const auto &google=irmail_settings();
+    if (!google.google_scope(GOOGLE_DRIVE_SCOPE)) page.line("Sign in with Google and allow Drive access first.");
+    page.line("Folder: "+irdrive_folder());
+    page.line(irdrive_ready() ? "Drive backup: on. Disconnect Network, then tap HotSync with no desktop waiting." : "Drive backup: off.");
+    page.line("Backs up all RAM databases and applications as PDB/PRC files, including private records and preferences. ROM and expansion cards are excluded.");
+    page.line("Newest wins: a newer Drive file installs/replaces its Palm database; newer Palm data updates Drive. Equal times keep the Palm copy. Replaced Palm data is saved in Recovery first.");
+    page.link(settings.enabled ? "/driveon/0" : "/driveon/1",settings.enabled ? "Turn Drive backup off" : "Turn Drive backup on");
+    page.link("/drivecheck","Check Drive access");
+    page.link("/drivegoogle","Sign in with Google (from a PC)");
+    page.line(settings.restore_saved ? "Saved backups will restore missing databases at the next HotSync." : "To recover missing databases from existing backups, request a one-time restore.");
+    page.link("/driverestore","Restore saved backups once");
+    String interrupted=irdrive_interrupted_name();
+    if (interrupted.length()) {
+        page.line("Interrupted installation: "+interrupted+". Retry removes this incomplete Palm database and reinstalls it from Drive.");
+        page.link("/driveretry","Retry interrupted install");
+    }
+    page.line("The Palm HotSync user name selects the folder. Set a name for an unnamed Palm in the shared HotSync settings.");
+    page.link("/hotsync","HotSync user settings");
+    page.link(settings.cyrillic ? "/drivetext/0" : "/drivetext/1",settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    String last=irdrive_last_result(); if (last.length()) page.line("Last sync: "+last);
     page.link("/","Back"); page.send();
 }
 
@@ -1215,10 +1338,13 @@ static void handle_mail_test() {
 
 // The Palm cannot show Google's sign-in page: open the sign-in pages to a PC on
 // the same Wi-Fi for a while, and say where to find them
-static void handle_mail_google(bool tasks = false, bool calendar = false, bool contacts = false) {
+static void handle_mail_google(bool tasks = false, bool calendar = false, bool contacts = false, bool drive = false, int notes = -1, bool expenses = false) {
     s_google_from_tasks = tasks;
     s_google_from_calendar = calendar;
     s_google_from_contacts = contacts;
+    s_google_from_drive = drive;
+    s_google_from_notes = notes;
+    s_google_from_expenses = expenses;
     Page page("Sign in with Google");
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -1231,7 +1357,7 @@ static void handle_mail_google(bool tasks = false, bool calendar = false, bool c
         page.line("http://" + WiFi.localIP().toString() + "/google");
         page.line("You need your own Google OAuth client (client ID and secret): see docs/google/README.md in the project.");
     }
-    page.link(contacts ? "/contacts" : calendar ? "/calendar" : tasks ? "/tasks" : "/mail", "Back");
+    page.link(expenses ? "/expenses" : notes>=0 ? (notes ? "/notes" : "/memos") : drive ? "/drive" : contacts ? "/contacts" : calendar ? "/calendar" : tasks ? "/tasks" : "/mail", "Back");
     page.send();
 }
 
@@ -1266,7 +1392,7 @@ static void handle_pc_google() {
               "(docs/google/README.md in the project has the steps), and enter it here:");
     page.line("This sign-in requests Mail, Tasks, Contacts, Calendar, Drive, Docs, Sheets and Slides access together.");
     page.line("Basic profile access identifies the Google account for Contacts sync.");
-    page.line("Drive, Docs, Sheets and Slides features are planned; their permissions can be granted now.");
+    page.line("Drive backs up Palm databases and Note Pad drawings; Docs syncs Memo Pad text; Sheets syncs Expenses. Slides permission is prepared for future features.");
     page.line("Leave the client secret blank to keep the stored secret for this client ID.");
     pc_google_form(page, mail.address, mail.google_client_id);
     page.send();
@@ -1312,7 +1438,26 @@ static void handle_pc_google_done() {
         page.send();
         return;
     }
-    if (s_google_from_contacts) {
+    if (s_google_from_expenses) {
+        IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
+        auto expenses=irexpenses_settings(); expenses.enabled=mail.google_scope(GOOGLE_DRIVE_SCOPE) && mail.google_scope(GOOGLE_SHEETS_SCOPE);
+        if (!expenses.enabled) page.line("Google did not grant Drive and Sheets access. Sign in again and allow both.");
+        else page.line(irexpenses_store_settings(expenses) ? "Expenses sync is on." : "Could not enable Expenses sync.");
+        page.line(irexpenses_check_login());
+    } else if (s_google_from_notes>=0) {
+        IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
+        bool drawing=s_google_from_notes==1;
+        auto notes=irnotes_settings(drawing); notes.enabled=mail.google_scope(GOOGLE_DRIVE_SCOPE) && (drawing || mail.google_scope(GOOGLE_DOCS_SCOPE));
+        if (!notes.enabled) page.line("Google did not grant the required Drive/Docs permissions. Sign in again and allow them.");
+        else page.line(irnotes_store_settings(drawing,notes) ? "Notes sync is on." : "Could not enable notes sync.");
+        page.line(irnotes_check_login(drawing));
+    } else if (s_google_from_drive) {
+        IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
+        auto drive=irdrive_settings(); drive.enabled=mail.google_scope(GOOGLE_DRIVE_SCOPE);
+        if (!drive.enabled) page.line("Google did not grant Drive access. Sign in again and allow Drive.");
+        else page.line(irdrive_store_settings(drive) ? "Drive backup is on." : "Could not enable Drive backup. Enable it from the Palm's Drive page.");
+        page.line(irdrive_check_login());
+    } else if (s_google_from_contacts) {
         IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
         auto contacts=ircontacts_settings(); contacts.enabled=mail.google_contacts();
         if (!contacts.enabled) page.line("Google did not grant both Contacts and basic profile access. Sign in again and allow both.");
@@ -1907,6 +2052,67 @@ static void route_request() {
         s_proxy_all_sites = (index == 1);
         store_settings();
         handle_status();
+    }
+    else if (path=="/hotsync" && !indexed) handle_hotsync();
+    else if ((path=="/hotsyncsave" || path=="/drivesave") && !indexed) handle_hotsync(true);
+    else if (path=="/hotsynctext" && indexed && index>=0 && index<=1) {
+        auto settings=irhotsync_settings(); settings.cyrillic=index==1; String problem;
+        if (!irhotsync_store_settings(settings,problem)) { Page page("HotSync Settings"); page.line(problem); page.link("/hotsync","Back"); page.send(); }
+        else handle_hotsync();
+    }
+    else if (path=="/expenses" && !indexed) handle_expenses();
+    else if (path=="/expensescheck" && !indexed) {
+        Page page("Expenses Access"); page.line(irexpenses_check_login()); page.link("/expenses","Back"); page.send();
+    }
+    else if (path=="/expensesgoogle" && !indexed) handle_mail_google(false,false,false,false,-1,true);
+    else if (path=="/expensesretry" && !indexed) {
+        Page page("Expense Retry"); page.line(irexpenses_retry_creations() ? "Currently unconfirmed creations will be checked and retried at the next HotSync." : "No unconfirmed creations are pending, or state could not be saved."); page.link("/expenses","Back"); page.send();
+    }
+    else if ((path=="/expenseson" || path=="/expensestext" || path=="/expensesconflict") && indexed && index>=0 && index<=2) {
+        auto settings=irexpenses_settings(); bool valid=true;
+        if (path=="/expensesconflict") settings.conflicts=index;
+        else if (index>1) valid=false;
+        else if (path=="/expenseson") settings.enabled=index==1;
+        else settings.cyrillic=index==1;
+        if (!valid || !irexpenses_store_settings(settings)) { Page page("Expense Settings"); page.line("Could not save Expense settings."); page.link("/expenses","Back"); page.send(); }
+        else handle_expenses();
+    }
+    else if ((path=="/memos" || path=="/notes") && !indexed) handle_notes(path=="/notes");
+    else if ((path=="/memoscheck" || path=="/notescheck") && !indexed) {
+        bool drawing=path=="/notescheck"; Page page("Notes Access"); page.line(irnotes_check_login(drawing)); page.link(drawing ? "/notes" : "/memos","Back"); page.send();
+    }
+    else if ((path=="/memosgoogle" || path=="/notesgoogle") && !indexed) handle_mail_google(false,false,false,false,path=="/notesgoogle" ? 1 : 0);
+    else if (path=="/memosretry" && !indexed) {
+        Page page("Memo Retry"); page.line(irnotes_retry_creations(false) ? "Currently unconfirmed creations will be checked and retried at the next HotSync." : "No unconfirmed creations are pending, or sync state could not be saved."); page.link("/memos","Back"); page.send();
+    }
+    else if ((path=="/memoson" || path=="/noteson" || path=="/memostext" || path=="/notestext" || path=="/memosconflict" || path=="/notesconflict") && indexed && index>=0 && index<=2) {
+        bool drawing=path.startsWith("/notes"); auto settings=irnotes_settings(drawing);
+        bool valid=true;
+        if (path.endsWith("conflict")) settings.conflicts=index;
+        else if (index>1) valid=false;
+        else if (path.endsWith("on")) settings.enabled=index==1;
+        else settings.cyrillic=index==1;
+        if (!valid || !irnotes_store_settings(drawing,settings)) { Page page("Notes Settings"); page.line("Could not save notes settings."); page.link(drawing ? "/notes" : "/memos","Back"); page.send(); }
+        else handle_notes(drawing);
+    }
+    else if (path == "/drive" && !indexed) handle_drive();
+    else if (path == "/drivecheck" && !indexed) {
+        Page page("Drive Access"); page.line(irdrive_check_login()); page.link("/drive","Back"); page.send();
+    }
+    else if (path == "/drivegoogle" && !indexed) handle_mail_google(false,false,false,true);
+    else if (path == "/driverestore" && !indexed) {
+        Page page("Drive Restore"); page.line(irdrive_restore_once() ? "Missing databases from saved backups will restore at the next HotSync." : "Could not save the restore request.");
+        page.link("/drive","Back"); page.send();
+    }
+    else if (path == "/driveretry" && !indexed) {
+        Page page("Drive Retry"); page.line(irdrive_retry_interrupted() ? "The interrupted install will retry at the next HotSync." : "No interrupted install is pending, or the request could not be saved.");
+        page.link("/drive","Back"); page.send();
+    }
+    else if ((path == "/driveon" || path == "/drivetext") && indexed && index>=0 && index<=1) {
+        auto settings=irdrive_settings();
+        if (path=="/driveon") settings.enabled=index==1; else settings.cyrillic=index==1;
+        if (!irdrive_store_settings(settings)) { Page page("Drive Settings"); page.line("Could not save Drive settings."); page.link("/drive","Back"); page.send(); }
+        else handle_drive();
     }
     else if (path == "/contacts" && !indexed) handle_contacts();
     else if (path == "/contactscheck" && !indexed) {

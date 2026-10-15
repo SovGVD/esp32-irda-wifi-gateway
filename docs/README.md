@@ -20,8 +20,12 @@ Start with [hardware and wiring](hardware.md), then [build and flash the firmwar
 - [Tasks / To Do List](google/tasks.md)
 - [Calendar / Date Book](google/calendar.md)
 - [Contacts / Address Book](google/contacts.md)
+- [Memo Pad / Google Docs](google/memos.md)
+- [Note Pad drawings / Drive PNG](google/notes.md)
+- [Expenses / Google Sheets](google/expenses.md)
+- [Drive / full backup and restore](google/drive.md)
 
-Drive, Docs, Sheets and Slides permission is prepared in the shared sign-in for future features; their sync is not implemented.
+Slides permission is prepared in the shared sign-in for future features; Slides sync is not implemented.
 
 ## Reference
 

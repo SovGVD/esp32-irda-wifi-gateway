@@ -12,7 +12,15 @@ public:
                          const char *type, const std::string &body, const std::string &etag,
                          std::string &reply) override;
     std::string error() const override { return error_; }
+    int transfer(const std::string &url,const char *method,const std::string &auth,const char *type,
+                 size_t size,const GoogleRead &read,const GoogleHeaders &headers,std::string &reply,
+                 GoogleHeaders &response_headers) override;
+    int download(const std::string &url,const std::string &auth,const GoogleHeaders &headers,
+                 size_t limit,std::string &reply,GoogleHeaders &response_headers) override;
 private:
+    int transfer_bounded(const std::string &url,const char *method,const std::string &auth,const char *type,
+                         size_t size,const GoogleRead &read,const GoogleHeaders &headers,std::string &reply,
+                         GoogleHeaders &response_headers,size_t response_limit);
     struct Response;
     bool keep_alive_;
     unsigned timeout_ms_;

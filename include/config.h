@@ -197,6 +197,25 @@
 #define CONTACTS_HTTP_TIMEOUT_MS    12000
 #define CONTACTS_HTTP_RESPONSE_MAX  32000
 
+// Memo Pad / Google Docs and Palm OS 4 Note Pad / Drive PNG sync.
+#define NOTES_MAX_PER_SYNC         64
+#define NOTES_CONTENT_MEMORY       64000
+#define NOTES_HTTP_TIMEOUT_MS      20000
+#define NOTES_HTTP_RESPONSE_MAX    32768
+
+// Classic ExpenseDB / Google Sheets, using the existing shared authorization.
+#define EXPENSES_MAX_PER_SYNC       64
+#define EXPENSES_CONTENT_MEMORY     24000 // combined Palm + Sheets content
+#define EXPENSES_HTTP_TIMEOUT_MS    20000
+#define EXPENSES_HTTP_RESPONSE_MAX  48000
+
+// Google Drive: full RAM database/application backup and PDB/PRC installs.
+#define DRIVE_MAX_DATABASES         512
+#define DRIVE_MAX_FILES             512
+#define DRIVE_FOLDER_MEMORY         64000
+#define DRIVE_HTTP_TIMEOUT_MS       20000
+#define DRIVE_HTTP_RESPONSE_MAX     32000
+
 // ==============================================================================
 // Debug Logging
 // ==============================================================================

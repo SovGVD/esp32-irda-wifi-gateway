@@ -2,6 +2,8 @@
 
 [Documentation](README.md)
 
+**HotSync user name:** configure it once under **wifi.setup → HotSync settings**. It is shared by Memo Pad, Note Pad, Expenses and Drive, and applied to an unnamed Palm at the next standalone HotSync. Existing names and numeric identities are preserved. See [HotSync user setup](hotsync.md#set-the-hotsync-user-name-from-the-palm).
+
 Firmware settings are in [`include/config.h`](../include/config.h). Google scope definitions are in [`include/googlescopes.h`](../include/googlescopes.h).
 
 | Setting | Default | Purpose |
@@ -18,7 +20,7 @@ Firmware settings are in [`include/config.h`](../include/config.h). Google scope
 | `PROXY_MAX_PAGE_BYTES` | 48000 | Longer pages are cut off |
 | `XIINO_DATASERVER_HOST` | `pds.mobirus.com` | Name under which the adapter stands in for Xiino's DataServer |
 | `PPP_GATEWAY_IP` / `PPP_PALM_IP` | `192.168.99.1` / `.2` | Addresses on the link between adapter and Palm |
-| `MAIL_PC_ANSWER_TIMEOUT_MS` | 1500 | How long a HotSync waits for a desktop on USB before standalone Mail / Tasks / Calendar / Contacts sync |
+| `MAIL_PC_ANSWER_TIMEOUT_MS` | 1500 | How long a HotSync waits for a desktop on USB before standalone Drive / Mail / Tasks / Calendar / Contacts sync |
 | `MAIL_DEFAULT_IMAP_SERVER` / `MAIL_DEFAULT_SMTP_SERVER` | Gmail's | Mail servers until others are entered in the portal |
 | `MAIL_MAX_PER_SYNC` / `MAIL_MAX_SEND_PER_SYNC` | 15 / 10 | Newest inbox messages looked at, and Outbox messages sent, per sync |
 | `MAIL_HTML_FETCH_MAX` | 96000 | Bytes read of a message that only exists as HTML |
@@ -32,5 +34,12 @@ Firmware settings are in [`include/config.h`](../include/config.h). Google scope
 | `CALENDAR_HTTP_TIMEOUT_MS` / `CALENDAR_HTTP_RESPONSE_MAX` | 12000 / 32000 | Calendar HTTPS timeout and response byte limit |
 | `CONTACTS_MAX_PER_SYNC` | 64 | Maximum Google, linked and relevant Palm contacts; the combined public book must also fit |
 | `CONTACTS_HTTP_TIMEOUT_MS` / `CONTACTS_HTTP_RESPONSE_MAX` | 12000 / 32000 | Contacts HTTPS timeout and response byte limit |
+| `NOTES_MAX_PER_SYNC` / `NOTES_CONTENT_MEMORY` | 64 / 64000 | Memo/Note record count and combined content byte budget, per conduit |
+| `NOTES_HTTP_TIMEOUT_MS` / `NOTES_HTTP_RESPONSE_MAX` | 20000 / 32768 | Memo/Note HTTPS timeout and response byte limit |
+| `EXPENSES_MAX_PER_SYNC` / `EXPENSES_CONTENT_MEMORY` | 64 / 24000 | Expense record/row count and combined Palm/Sheets content byte budget |
+| `EXPENSES_HTTP_TIMEOUT_MS` / `EXPENSES_HTTP_RESPONSE_MAX` | 20000 / 48000 | Expenses HTTPS timeout and response byte limit |
+| `DRIVE_MAX_DATABASES` / `DRIVE_MAX_FILES` | 512 / 512 | Maximum RAM databases and immediate Drive folder entries |
+| `DRIVE_FOLDER_MEMORY` | 64000 | Approximate in-memory Drive listing metadata budget in bytes |
+| `DRIVE_HTTP_TIMEOUT_MS` / `DRIVE_HTTP_RESPONSE_MAX` | 20000 / 32000 | Drive HTTPS timeout and response byte limit |
 | `ENABLE_CDC_DEBUG` | 0 | Print a protocol trace on USB instead of serial data |
 | `CURRENT_OP_MODE` | `MODE_IRCOMM` | `MODE_RAW_SIR` turns the adapter into a plain IR pulse bridge without the IrDA stack |

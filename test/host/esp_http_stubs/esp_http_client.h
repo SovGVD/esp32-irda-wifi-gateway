@@ -1,12 +1,13 @@
 #pragma once
 #include "esp_err.h"
 enum esp_http_client_method_t { HTTP_METHOD_GET,HTTP_METHOD_POST,HTTP_METHOD_PUT,HTTP_METHOD_PATCH,HTTP_METHOD_DELETE };
-enum esp_http_client_event_id_t { HTTP_EVENT_ON_DATA };
-struct esp_http_client_event_t { esp_http_client_event_id_t event_id; void *user_data; void *data; int data_len; };
+enum esp_http_client_event_id_t { HTTP_EVENT_ON_DATA,HTTP_EVENT_ON_HEADER };
+struct esp_http_client_event_t { esp_http_client_event_id_t event_id; void *user_data; void *data; int data_len;
+    const char *header_key=nullptr,*header_value=nullptr; };
 struct esp_http_client_config_t {
     const char *url;
     esp_err_t (*crt_bundle_attach)(void *);
-    int timeout_ms,buffer_size_tx;
+    int timeout_ms,buffer_size_tx,buffer_size;
     bool disable_auto_redirect;
     esp_err_t (*event_handler)(esp_http_client_event_t *);
     void *user_data;

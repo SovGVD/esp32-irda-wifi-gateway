@@ -6,7 +6,7 @@
 #include "mailoauth.h"
 
 // Standalone HotSync session: when no desktop answers, the adapter runs the
-// enabled Mail, Tasks, Calendar and Contacts conduits over Wi-Fi. Settings are
+// enabled Mail, Tasks, Calendar, Contacts, Memo Pad, Note Pad, Expenses and Drive conduits over Wi-Fi. Settings are
 // independent and entered in the portal; Google services share OAuth.
 
 struct IrMailSettings {

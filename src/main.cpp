@@ -8,6 +8,7 @@
 #include "irdebug.h"
 #include "irppp.h"
 #include "irmail.h"
+#include "irsyncdiag.h"
 
 // Ring Buffers for Bidirectional Serial Bridging
 static RingBuffer<USB_TO_IR_BUF_SIZE> s_usb_to_ir_fifo;
@@ -24,7 +25,7 @@ enum SessionType {
     SESSION_UNKNOWN, // Nothing received yet
     SESSION_SERIAL,  // HotSync or other serial data, bridged to USB CDC
     SESSION_PPP,     // Network connection, served by the Wi-Fi gateway
-    SESSION_MAIL     // HotSync that no desktop answered, served by the Mail / Tasks / Calendar / Contacts conduits
+    SESSION_MAIL     // HotSync that no desktop answered, served by the Mail / Tasks / Calendar / Contacts / Memo Pad / Note Pad / Expenses / Drive conduits
 };
 static SessionType s_session = SESSION_UNKNOWN;
 
@@ -596,6 +597,7 @@ static void process_raw_sir_mode() {
 // ------------------------------------------------------------------------------
 
 void setup() {
+    irsyncdiag_init();
     // 1. Initialize Native USB CDC
     Serial.setRxBufferSize(USB_CDC_RX_BUF_SIZE);
     Serial.begin(115200);
@@ -617,7 +619,7 @@ void setup() {
     // 5. Start Wi-Fi and the PPP gateway (no-op when WIFI_SSID is empty)
     irppp_init();
 
-    // 6. Standalone Mail / Tasks / Calendar / Contacts conduits for HotSync sessions that no desktop answers
+    // 6. Standalone Mail / Tasks / Calendar / Contacts / Memo Pad / Note Pad / Expenses / Drive conduits for HotSync sessions that no desktop answers
     irmail_init();
 }
 

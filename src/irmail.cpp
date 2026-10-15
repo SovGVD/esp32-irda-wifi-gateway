@@ -5,6 +5,11 @@
 #include "irtasks.h"
 #include "ircalendar.h"
 #include "ircontacts.h"
+#include "irdrive.h"
+#include "irnotes.h"
+#include "irexpenses.h"
+#include "irhotsync.h"
+#include "irsyncdiag.h"
 #include "mailoauth.h"
 #include <WiFi.h>
 #include <Preferences.h>
@@ -103,7 +108,7 @@ bool irmail_enabled() {
 }
 
 bool irmail_ready() {
-    return s_from_palm != nullptr && (irmail_enabled() || irtasks_ready() || ircalendar_ready() || ircontacts_ready());
+    return s_from_palm != nullptr && (irmail_enabled() || irtasks_ready() || ircalendar_ready() || ircontacts_ready() || irdrive_ready() || irnotes_ready(false) || irnotes_ready(true) || irexpenses_ready() || irhotsync_settings().username.length());
 }
 
 String irmail_last_result() {
@@ -136,6 +141,8 @@ public:
 
     bool connect(const char *host, uint16_t port) override {
         close();
+        if (s_running) irsyncdiag_checkpoint("Mail TLS connect");
+        if (!irsyncdiag_memory_available(16384,48*1024)) return false;
         esp_tls_cfg_t config = {};
         config.crt_bundle_attach = esp_crt_bundle_attach;
         config.timeout_ms = MAIL_CONNECT_TIMEOUT_MS;
@@ -149,6 +156,7 @@ public:
             close();
             return false;
         }
+        if (s_running) irsyncdiag_checkpoint("Mail TLS connected");
         return true;
     }
 
@@ -251,7 +259,7 @@ void irmail_check_login(String &receiving, String &sending) {
 }
 
 // ------------------------------------------------------------------------------
-// Shared Google Sign-In (Mail, Tasks, Calendar and Contacts, from a PC browser)
+// Shared Google Sign-In (Mail, Tasks, Calendar, Contacts, Memo Pad, Note Pad, Expenses and Drive, from a PC browser)
 // ------------------------------------------------------------------------------
 
 // The sign-in in progress: what was entered, and the PKCE verifier whose
@@ -459,6 +467,8 @@ private:
 };
 
 static void run_sync() {
+    irsyncdiag_service("HotSync handshake");
+    bool failed=true;
     size_t memory_size = HOTSYNC_BUFFER_SIZE(MAILSYNC_RECORD_MAX);
     uint8_t *memory = (uint8_t *)malloc(memory_size);
     String result;
@@ -468,11 +478,49 @@ static void run_sync() {
     } else if (!hotsync_accept(&k_palm_io, memory, memory_size, MAIL_ACCEPT_TIMEOUT_MS)) {
         result = "the HotSync did not start";
     } else {
+        failed=false;
+        irsyncdiag_service("Palm identification");
         uint32_t rom = 0;
         hotsync_read_sys_info(&rom);
         irdbg_printf("Mail: HotSync started, Palm OS %u.%u, free memory %u", (unsigned)(rom >> 24), (unsigned)((rom >> 20) & 0x0F),
                      (unsigned)ESP.getFreeHeap());
 
+        auto resize=[&](size_t bytes) {
+            irsyncdiag_checkpoint("Resizing HotSync buffer");
+            if (bytes>memory_size && !irsyncdiag_memory_available(bytes,64*1024)) return false;
+            auto *next=(uint8_t *)realloc(memory,bytes);
+            if (!next) return false;
+            memory=next; memory_size=bytes; return hotsync_resize_buffer(memory,memory_size);
+        };
+        DriveBackupResult incoming;
+        // Explicit full restore recovers the saved numeric identity first.
+        // Otherwise supply the global name before any conduit binds folders.
+        bool restoring=irdrive_ready() && irdrive_settings().restore_saved;
+        bool user_prepared=!restoring;
+        String user_problem;
+        if (!restoring && !irhotsync_prepare(user_problem)) { incoming.problem=user_problem.c_str(); incoming.link_lost=hotsync_error()==HOTSYNC_ERR_LINK; }
+        if (irdrive_ready() && incoming.problem.empty()) {
+            irsyncdiag_service("Drive restore");
+            irdrive_restore(incoming,[&](size_t record_bytes) {
+                size_t bytes=HOTSYNC_BUFFER_SIZE(record_bytes);
+                return bytes<=memory_size || resize(bytes);
+            });
+            // Shrink before the remaining conduits need their TLS/snapshots.
+            if (memory_size>HOTSYNC_BUFFER_SIZE(MAILSYNC_RECORD_MAX) &&
+                !resize(HOTSYNC_BUFFER_SIZE(MAILSYNC_RECORD_MAX)) && incoming.problem.empty())
+                incoming.problem="Could not release the Drive restore buffer";
+        }
+        if (restoring && incoming.problem.empty() && !incoming.link_lost) {
+            user_prepared=true;
+            if (!irhotsync_prepare(user_problem)) { incoming.problem=user_problem.c_str(); incoming.link_lost=hotsync_error()==HOTSYNC_ERR_LINK; }
+        }
+        String user_result=user_prepared ? irhotsync_last_result() : String();
+        if (user_result.length()) {
+            result=user_result;
+            if (!incoming.link_lost && hotsync_error()!=HOTSYNC_ERR_LINK) hotsync_add_log(("HotSync: "+user_result+"\n").c_str());
+        }
+
+        failed=!incoming.problem.empty() || incoming.link_lost;
         MailSyncSetup setup;
         setup.address = s_settings.address.c_str();
         setup.name = s_settings.name.c_str();
@@ -491,46 +539,103 @@ static void run_sync() {
         setup.html_fetch_max = MAIL_HTML_FETCH_MAX;
 
         MailSyncResult outcome;
-        if (irmail_enabled()) {
+        bool can_sync=incoming.problem.empty() && !incoming.link_lost;
+        if (irmail_enabled() && can_sync) {
+            irsyncdiag_service("Mail");
             Esp32MailHost host;
             mailsync_run(setup, host, outcome);
+            failed=failed || !outcome.problem.empty();
         }
-        result = irmail_enabled() ? String(mailsync_summary(outcome).c_str()) : String("");
-        bool lost = outcome.link_lost;
-        if (irmail_enabled() && !lost) hotsync_add_log(("Mail: " + result + "\n").c_str());
-        if (!lost && irtasks_ready()) {
+        result = irmail_enabled() && can_sync ? String(mailsync_summary(outcome).c_str()) : user_result;
+        bool lost = outcome.link_lost || incoming.link_lost;
+        if (irmail_enabled() && can_sync && !lost) hotsync_add_log(("Mail: " + result + "\n").c_str());
+        if (!lost && can_sync && irtasks_ready()) {
             TaskSyncResult tasks;
+            irsyncdiag_service("Tasks");
             irtasks_sync(tasks);
+            failed=failed || !tasks.problem.empty();
             String summary = tasksync_summary(tasks).c_str();
             if (!tasks.link_lost) hotsync_add_log(("Tasks: " + summary + "\n").c_str());
             lost = tasks.link_lost;
             if (result.length()) result += "; ";
             result += "Tasks: " + summary;
         }
-        if (!lost && ircalendar_ready()) {
+        if (!lost && can_sync && ircalendar_ready()) {
             CalendarSyncResult calendar;
+            irsyncdiag_service("Calendar");
             ircalendar_sync(calendar);
+            failed=failed || !calendar.problem.empty();
             String summary=calendarsync_summary(calendar).c_str();
             if (!calendar.link_lost) hotsync_add_log(("Calendar: "+summary+"\n").c_str());
             lost=calendar.link_lost;
             if (result.length()) result+="; ";
             result+="Calendar: "+summary;
         }
-        if (!lost && ircontacts_ready()) {
+        if (!lost && can_sync && ircontacts_ready()) {
             ContactSyncResult contacts;
+            irsyncdiag_service("Contacts");
             ircontacts_sync(contacts);
+            failed=failed || !contacts.problem.empty();
             String summary=contactsync_summary(contacts).c_str();
             if (!contacts.link_lost) hotsync_add_log(("Contacts: "+summary+"\n").c_str());
             lost=contacts.link_lost;
             if (result.length()) result+="; ";
             result+="Contacts: "+summary;
         }
+        for (unsigned drawing=0;drawing<2 && !lost && can_sync;drawing++) {
+            if (!irnotes_ready(drawing)) continue;
+            irsyncdiag_service(drawing ? "Note Pad" : "Memos");
+            NoteSyncResult notes; irnotes_sync(drawing,notes,[&](size_t record_bytes) {
+                size_t bytes=HOTSYNC_BUFFER_SIZE(record_bytes);
+                return bytes<=memory_size || resize(bytes);
+            },[&]() {
+                size_t bytes=HOTSYNC_BUFFER_SIZE(MAILSYNC_RECORD_MAX);
+                return memory_size<=bytes || resize(bytes);
+            });
+            if (memory_size>HOTSYNC_BUFFER_SIZE(MAILSYNC_RECORD_MAX) &&
+                !resize(HOTSYNC_BUFFER_SIZE(MAILSYNC_RECORD_MAX)) && notes.problem.empty())
+                notes.problem="Could not release the Note Pad record buffer";
+            failed=failed || !notes.problem.empty();
+            String summary=notesync_summary(notes).c_str();
+            String label=drawing ? "Note Pad: " : "Memos: ";
+            if (!notes.link_lost) hotsync_add_log((label+summary+"\n").c_str());
+            lost=notes.link_lost;
+            if (result.length()) result+="; ";
+            result+=label+summary;
+        }
+        if (!lost && can_sync && irexpenses_ready()) {
+            irsyncdiag_service("Expenses");
+            ExpenseSyncResult expenses; irexpenses_sync(expenses);
+            failed=failed || !expenses.problem.empty();
+            String summary=expensesync_summary(expenses).c_str();
+            if (!expenses.link_lost) hotsync_add_log(("Expenses: "+summary+"\n").c_str());
+            lost=expenses.link_lost;
+            if (result.length()) result+="; ";
+            result+="Expenses: "+summary;
+        }
+        if (irdrive_ready()) {
+            DriveBackupResult drive;
+            if (lost) { drive=incoming; drive.link_lost=true; if (drive.problem.empty()) drive.problem="Final backup skipped because the Palm link was lost"; }
+            else if (!incoming.problem.empty()) drive=incoming;
+            // Export reads at most 1 KiB at a time and can reuse the smaller
+            // Mail buffer. Only incoming installation needs a full record.
+            else { irsyncdiag_service("Drive backup"); irdrive_sync(drive); }
+            failed=failed || !drive.problem.empty();
+            String summary=drivebackup_summary(drive).c_str();
+            irdrive_record_result(drive);
+            if (!drive.link_lost) hotsync_add_log(("Drive: "+summary+"\n").c_str());
+            lost=drive.link_lost;
+            if (result.length()) result+="; ";
+            result+="Drive: "+summary;
+        }
+        failed=failed || lost;
         if (lost) result += " (the link to the Palm was lost)";
-        else hotsync_end(0);
+        else { irsyncdiag_checkpoint("Ending Palm session"); if (!hotsync_end(0)) failed=true; }
     }
     irdbg_printf("Mail: %s", result.c_str());
     strlcpy(s_last_result, result.c_str(), sizeof(s_last_result));
     free(memory);
+    irsyncdiag_finish(failed ? "HotSync failed or connection interrupted" : "HotSync completed",failed);
 }
 
 static void mail_task(void *arg) {
@@ -551,6 +656,10 @@ void irmail_init() {
     irtasks_init();
     ircalendar_init();
     ircontacts_init();
+    irdrive_init();
+    irhotsync_init();
+    irnotes_init();
+    irexpenses_init();
     s_from_palm = xStreamBufferCreate(MAIL_STREAM_SIZE, 1);
     s_to_palm = xStreamBufferCreate(MAIL_STREAM_SIZE, 1);
     if (s_from_palm == nullptr || s_to_palm == nullptr) {
@@ -562,9 +671,12 @@ void irmail_init() {
 }
 
 bool irmail_start(const uint8_t *opening, size_t len) {
+    static uint32_t last_task_failure=0;
     if (s_from_palm == nullptr || s_running) {
         return false;
     }
+    if (last_task_failure && millis()-last_task_failure<1000) return false;
+    irsyncdiag_begin();
     xStreamBufferReset(s_from_palm);
     xStreamBufferReset(s_to_palm);
     xStreamBufferSend(s_from_palm, opening, len, 0);
@@ -572,6 +684,9 @@ bool irmail_start(const uint8_t *opening, size_t len) {
     s_running = true;
     if (xTaskCreate(mail_task, "mail", MAIL_TASK_STACK, NULL, 1, NULL) != pdPASS) {
         s_running = false;
+        last_task_failure=millis();
+        strlcpy(s_last_result,"Not enough memory to create HotSync task",sizeof(s_last_result));
+        irsyncdiag_finish("Not enough memory to create HotSync task",true);
         return false;
     }
     return true;

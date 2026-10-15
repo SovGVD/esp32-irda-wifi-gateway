@@ -2,7 +2,7 @@
 
 [Documentation](../README.md)
 
-Standalone HotSync synchronises the built-in **Date Book** (`DatebookDB`, Palm IIIx format) with one writable Google calendar. Mail runs first, then Tasks, Calendar and Contacts, according to their separate switches. A desktop listening on USB takes priority.
+Standalone HotSync synchronises the built-in **Date Book** (`DatebookDB`, Palm IIIx format) with one writable Google calendar. Enabled conduits run after incoming Drive restores: Mail, Tasks, Calendar, Contacts, Memo Pad and Note Pad, followed by the final Drive backup. A desktop listening on USB takes priority.
 
 ## Setup
 

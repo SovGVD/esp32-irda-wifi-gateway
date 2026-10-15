@@ -35,7 +35,7 @@ std::string mail_xoauth2(const std::string &user, const std::string &access_toke
 // Percent-encoding for addresses and forms: everything but A-Z a-z 0-9 - . _ ~
 std::string oauth_encode(const std::string &text);
 
-// Exact scope membership, also used by future Contacts / Calendar / Drive clients.
+// Exact scope membership, also used by the Google service clients.
 bool oauth_has_scope(const std::string &granted, const std::string &scope);
 
 // PKCE S256 challenge of a verifier: BASE64URL(SHA-256(verifier)), no padding

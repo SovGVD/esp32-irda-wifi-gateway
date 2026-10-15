@@ -2,7 +2,7 @@
 
 [Documentation](../README.md)
 
-The adapter synchronises the Palm's built-in **To Do List** (`ToDoDB`) with **one Google task list** during standalone HotSync. Mail, Tasks, Calendar and Contacts have separate switches and can run together. A desktop listening on USB still takes priority.
+The adapter synchronises the Palm's built-in **To Do List** (`ToDoDB`) with **one Google task list** during standalone HotSync. Mail, Tasks, Calendar, Contacts, Memo Pad, Note Pad, Expenses and Drive have separate switches and can run together. A desktop listening on USB still takes priority.
 
 > [!NOTE]
 > Google Tasks is reported working on the device and has passed simulated Palm/API tests and the firmware build. See [testing and validation](../development.md#validation-status) for the evidence and remaining checks.
@@ -17,7 +17,7 @@ Tasks shares the adapter's **Sign in with Google** flow with Mail: the same Desk
 4. Continue to Google's consent page and allow **Mail, Tasks, Contacts, Calendar, Drive, Docs, Sheets and Slides**, plus **basic profile** access. Copy the loopback address Google redirects to and paste it into the adapter's page, as described in [Shared Google sign-in](README.md#shared-google-sign-in).
 5. Finishing from the Tasks page enables Tasks and preserves Mail's previous on/off setting. You can also turn Tasks on or off separately on the Palm.
 
-**Existing authorizations without the full grant must sign in again to add the missing permissions:** firmware changes cannot extend an already-issued token. Once all eight service permissions and basic profile permission are granted, Tasks, Calendar and Contacts and future Drive, Docs, Sheets and Slides features can use the same refresh token for operations covered by those scopes. Token expiry, revocation or additional scopes can still require another sign-in. Until Tasks permission has been granted, the Tasks page explains that reauthorization is needed; Mail can continue using its existing token.
+**Existing authorizations without the full grant must sign in again to add the missing permissions:** firmware changes cannot extend an already-issued token. Once all eight service permissions and basic profile permission are granted, Tasks, Calendar, Contacts, Drive, Memo Pad, Note Pad and Expenses, plus future Slides features can use the same refresh token for operations covered by those scopes. Token expiry, revocation or additional scopes can still require another sign-in. Until Tasks permission has been granted, the Tasks page explains that reauthorization is needed; Mail can continue using its existing token.
 
 The default list is `@default`. To use another list, enter its Google API ID (not its displayed name) on the Tasks page. A dedicated Google task list makes the first sync easier to review. Existing public Palm tasks are uploaded, and existing Google tasks are added to the Palm; matching titles are not treated as the same task.
 

@@ -80,12 +80,25 @@ Each one is started the same way: run the command, then tap HotSync on the Palm.
 
 ## Standalone sync over Wi-Fi
 
-The adapter gives a listening USB desktop priority. If no desktop answers within 1.5 seconds, it runs the enabled Mail, Tasks, Calendar and Contacts conduits in that order. Each has its own switch in the Palm portal. A saved Wi-Fi network and account setup are required, but a desktop is not needed during sync.
+### Set the HotSync user name from the Palm
+
+Open **wifi.setup → HotSync settings (user name)**, enter your name and tap **Save**. Disconnect **Prefs → Network**, then start HotSync with no desktop waiting. The adapter writes the name to an unnamed Palm before Memo Pad, Note Pad, Expenses or normal Drive sync runs. No desktop setup program is required. The setting also works when application conduits are off.
+
+This is one shared setting for all conduits. It preserves the Palm's numeric user ID and desktop sync metadata, so working Tasks/Contacts links remain attached to the same identity. An already-named Palm keeps its name. The page shows the user detected at the last standalone HotSync.
+
+Use up to **40 Palm characters**, in Western or Cyrillic encoding. For non-ASCII names, match the name encoding to the text settings of the conduits using it. Leave the configured name empty to disable automatic name setup. Older Drive-only fallback names are reused when they fit this limit.
+
+For a reset Palm with existing backups, enter the **original backup user name** here and choose **Drive backup → Restore saved backups once**. That explicit recovery restores the saved numeric identity first, before automatic name setup. Changing an adapter setting does not rename a named Palm or move/rebind existing Google folders.
+
+### Run the sync
+
+The adapter gives a listening USB desktop priority. If no desktop answers within 1.5 seconds, it applies the shared user-name setup, restores/installs incoming Google Drive files, runs the enabled Mail, Tasks, Calendar, Contacts, Memo Pad, Note Pad and Expenses conduits in that order, then backs up the resulting Palm databases to Drive. An explicit full restore recovers identity before the user-name setup. Each service has its own switch in the Palm portal. A saved Wi-Fi network and account setup are required, but a desktop is not needed during sync.
 
 Disconnect **Prefs → Network** before starting HotSync; the infrared link is shared. To sync with a desktop, start `pilot-xfer` or `jpilot` before tapping HotSync. Results appear in the Palm's HotSync log and the corresponding portal page.
 
 ## Related guides
 
+- [Google Drive backup and restore](google/drive.md)
 - [Mail](mail.md)
 - [Google services](google/README.md)
 - [Internet connection](internet.md)

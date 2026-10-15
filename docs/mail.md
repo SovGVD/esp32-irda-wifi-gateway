@@ -32,7 +32,7 @@ For Gmail OAuth, follow [Google sign-in and shared permissions](google/README.md
 In the **HotSync** application choose "IR to a PC/Handheld" and tap the HotSync icon, exactly as for a desktop sync.
 
 - The adapter passes the HotSync to USB first. A desktop program that is waiting (`pilot-xfer`, `jpilot`) answers within milliseconds and gets the session, as before.
-- If nothing answers within 1.5 seconds, the adapter runs the enabled Mail, Tasks, Calendar and Contacts conduits itself.
+- If nothing answers within 1.5 seconds, the adapter runs the enabled Mail, Tasks, Calendar, Contacts, Memo Pad, Note Pad, Expenses and Drive conduits itself.
 
 The outcome is written to the **HotSync log** on the Palm (HotSync → Log), for example `Mail: 1 sent, 3 received`, or the reason something failed. The portal's Mail page shows the same line.
 

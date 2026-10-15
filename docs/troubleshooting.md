@@ -31,7 +31,9 @@
   - `cannot connect to ...`: wrong server name, a server without TLS on that port, or a certificate that cannot be verified.
   - `Wi-Fi is not connected`: check the status page of the portal.
 - **The Palm reports a HotSync connection error with mail set up:**
-  - Set `ENABLE_CDC_DEBUG` to `1` and watch the trace: lines starting with `Mail:` show each step of the sync, and the free memory at its start.
+  - Open **wifi.setup → Diagnostics** after reconnecting. Check **Last reset**, **HotSync diagnostics since boot** and **Previous HotSync diagnostics**. The trace includes the last service/stage, free heap, largest allocatable block, task stack headroom and failed allocation size/function. It works with USB debug logging disabled.
+  - Breadcrumbs survive warm resets, including many panic/watchdog resets. On the next boot the adapter saves a valid interrupted/failed record in settings storage, keeping it through later boots when storage is available. A power loss or brownout before that boot can lose the latest record. This is a short trace, not a full panic backtrace.
+  - Drive restore now grows its HotSync buffer only for an actual incoming database's largest block; an ordinary backup uses the small streaming buffer. Low-memory HTTPS checks stop the operation with an error instead of deliberately starting another TLS connection under pressure. If it still fails, copy the diagnostics trace and the Palm's HotSync log; device testing is still needed to establish the cause of a particular reboot.
 - **Calendar or Contacts access reports `HTTP -1` while Tasks works:**
   - Update the firmware: older builds used ESP-IDF's 512-byte HTTPS request buffer, which could reject Google's long pagination URLs. The shared transport now sizes the buffer for the URL and headers, up to 16 KB.
   - Run the access check again. Transport failures now show the ESP-IDF error name (and socket error when available), initialization/header memory failures, or the response byte limit. These details are also used in HotSync logs. HTTP 403 continues to identify permission/API-access problems.
@@ -43,6 +45,50 @@
 - **Contacts access says OK, but HotSync reports `An Address Book record is too large or invalid`:**
   - The access check only reads Google; this error is from decoding a Palm `AddressDB` record. Older firmware incorrectly required unused header bytes and bits to be zero and rejected zero padding after the contact fields. Update the firmware and run HotSync again; the existing Google sign-in can be reused.
   - Genuine record errors now identify the zero-based record index, record ID, received byte count and reason, such as an unterminated field, unsupported phone label, field length over its limit or truncated HotSync response. Check **Address Book → Last sync** or the Palm's HotSync log. Sync stops before transferring contacts when the Palm snapshot cannot be decoded completely.
+
+## Google Drive backup
+
+- **Memo, Note Pad, Expenses or Drive asks to set a HotSync user:** open **wifi.setup → HotSync settings (user name)**, enter the name and save. Disconnect Network and tap HotSync. The adapter fills a missing Palm name without replacing its numeric user identity. An existing name stays unchanged. For a reset with existing backups, use the original name and request Restore saved backups once.
+- **`Drive backup upload was not confirmed (HTTP 404)` at the beginning:** update the firmware. The SDK's small receive buffer could truncate the long resumable-upload address. Upload setup now uses an 8 KiB receive buffer and a 404 session is restarted once using the same saved file ID and a rewound, validated source. Persistent failures retain the journal and include file/byte-range details; run HotSync again. This upload-session fix reuses the existing Google sign-in.
+
+- **Access says OK, but there are no backup files:** enable Drive backup and run standalone HotSync. The access check does not create folders or transfer data. Check the Drive result in the portal or HotSync log.
+- **HTTP 403:** enable Google Drive API in the OAuth client's Cloud project. If the Drive grant is missing, sign in again and allow it. Existing granted tokens can be reused.
+- **Clock or identity error:** correct the Palm clock and check the HotSync user name and Google account. For a reset, unnamed Palm, enter the original folder user name and choose Restore saved backups once.
+- **A removed Palm app does not come back:** its managed Drive backup is retained. Choose Restore saved backups once to reinstall missing backups. New, manually uploaded PDB/PRC files install automatically.
+- **Interrupted installation:** use Retry interrupted install. Partial installs cannot become new backups. The previous version, when replacing existing data, is preserved under Recovery.
+- **Folder moved, duplicate database, file/memory limit or unsupported format:** restore the saved folder path, keep a single file per internal database name, or address the reported limit. Sync stops instead of accepting an incomplete backup.
+
+See [Drive setup, restore behavior and limits](google/drive.md).
+
+## Expenses
+
+- **Access check passes but nothing syncs:** enable Expenses and run standalone HotSync. Before the first sync the check verifies Drive access and scopes; creating the spreadsheet additionally needs Google Sheets API enabled. Read the `Expenses:` HotSync log or Last sync on its portal page.
+- **Date or Amount is rejected:** use plain text, with `YYYY-MM-DD` dates through 2031. The adapter preserves amount strings without numeric conversion. Keep the original tab name, headers and column order.
+- **A linked row is missing:** restore its row and Record ID using Sheets undo/version history. Set `Deleted` to `TRUE` for intentional deletion; removing a live row does not authorize deleting its Palm copy.
+- **Both sides changed or the sheet changed during sync:** finish editing before HotSync. Reconcile competing fields or choose a conflict preference on the Expenses page. Changes after an upload can leave Sheet updates applied while Palm updates wait.
+- **A creation is unconfirmed:** wait and retry HotSync first. Check Drive and the spreadsheet before explicitly retrying current pending creations. For an interrupted incoming row link, restore the exact Record ID reported by the sync result on that row.
+- **Row/content limit:** remove audit rows marked `Deleted=TRUE` only after their deletion sync completes. Available ESP heap and shared settings storage also limit larger books; the existing partition layout is unchanged.
+
+See [Expenses / Google Sheets](google/expenses.md) for field values, recovery and limits.
+
+- **Expenses show currency `17`:** this is the Palm selector for New Zealand dollars. Updated firmware shows `NZD ($)` and upgrades existing numeric cells on successful sync. Use a specific currency label when editing in Sheets; `$` alone is ambiguous.
+
+## Memo Pad and Note Pad
+
+- **Access check passes but HotSync fails:** the check verifies Drive permissions/listing. Enable Google Docs API for Memo Pad; HotSync additionally checks Docs content, MemoDB or Palm OS 4 npadDB and image bounds. Read the conduit-specific result.
+- **Both sides changed:** the default stops for review. Reconcile the edits or choose Prefer Palm edits / Prefer Google edits on that conduit's page. Titles and pixels merge independently for drawings.
+- **Unconfirmed Google memo creation:** try HotSync again later so its saved marker can be found. Check Drive before choosing Retry unconfirmed creations; propagation delay can otherwise produce duplicates.
+- **Formatted Docs or unsupported PNG:** use plain single-tab text documents for editable memos. Drawings require non-interlaced PNGs up to 160 pixels wide, 32,000 decoded bitmap bytes and 64 KiB per file; scrolling canvases are supported. Standard Palm OS 4 Note Pad is supported; other drawing applications need their own codecs.
+
+See [Memo Pad](google/memos.md) and [Note Pad](google/notes.md) for formats, deletion rules and validation limits.
+
+- **Memos report `HTTP -1` / `Not enough memory to receive Google HTTPS response`:** update the firmware. Memo reads now omit unused Google Docs metadata, and the shared HTTPS adapter collects small blocks before releasing TLS and assembling the complete reply. Request/response JSON and duplicate note metadata are released earlier. Existing document IDs and sync mappings are retained; keep your documents and retry. If memory is still insufficient, the error distinguishes receiving from final contiguous assembly and reports bytes received. Copy that full result plus Diagnostics; limits remain enforced.
+- **Memos create Google Docs but report `Invalid Google Docs tab ID`:** update the firmware and sync again. Google uses dotted tab IDs such as `t.0`; older firmware applied the more restrictive Drive file ID validator. Saved creation mappings reuse the existing document on retry. Keep the existing documents and sync state.
+- **Memos report HTTP 400 about legacy text-level Document fields while requesting tabs content:** update the firmware and retry HotSync. The response-memory optimization initially selected both a legacy top-level `body` and tab content. The corrected field mask selects the body only inside `tabs.documentTab`. Existing Google sign-in, documents and saved sync mappings can be reused.
+- **Palm OS 4 Note Pad reports unsupported dimensions:** older firmware limited canvas height to 160 pixels. Update for scrolling canvases, bounded by decoded bitmap bytes instead of screen height. If it still fails, the result now distinguishes invalid dimensions, unsupported compression, truncated data and memory/buffer limits; copy the complete record-specific error.
+- **Note Pad reports `Truncated Note Pad RLE pair`:** update the firmware. The decoder now accepts a lone trailing payload byte only if the preceding complete runs already produce every bitmap byte, matching pilot-link, and accepts zero-count no-op runs. It still rejects incomplete or oversized drawings. If the error remains, copy the full **Note Pad → Last sync** result, including record ID, received bytes and decoded/expected counts; it is not evidence that your Palm OS version is wrong.
+- **Note Pad reports `Not enough memory to decode the PNG image`:** eight-bit grayscale is supported, but imports need file storage, decoder state and a decompression window as well as the Palm bitmap. Update the firmware for direct decoding from PNG chunks and smaller windows for small images. For the lowest memory use, export a non-interlaced one-bit black-and-white PNG no wider than 160 pixels; reducing compressed file size alone does not necessarily reduce decoder workspace. A failed import stops before note transfers. Keep the existing mappings; the updated error identifies the file and image dimensions/depth.
+- **Adding a PNG causes `Not enough free/contiguous memory for Google HTTPS`:** update the firmware. Older downloads reserved the full image before TLS and opened a new connection per 4 KiB range. The adapter now downloads the fixed revision in one bounded request, assembles it after TLS closes, and releases enlarged Palm record buffers before further Google work. Duplicate drawing snapshots/upload copies are also reduced. The HTTPS admission checks remain enforced. Retry with the same Drive file and saved mappings. If it still fails, copy the complete Note Pad result (including the file and operation) and the latest Diagnostics free-heap/largest-block entries.
 
 ## Related guides
 
