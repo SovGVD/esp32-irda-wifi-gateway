@@ -46,13 +46,20 @@ bool notesync_decode(const std::string &data,unsigned max,NoteSyncState &s) {
     }
     return true;
 }
-struct Local { uint32_t id; uint8_t attr,category; PalmNote note; };
+struct Local { uint32_t id; uint8_t attr,category; PalmNote note; std::array<uint32_t,2> fields; };
+// Keep only compact fingerprints between records. Scope guards also release
+// reloaded bitmaps on conflicts, interrupted operations and early returns.
+struct BitmapRelease {
+    PalmNote *note;
+    explicit BitmapRelease(PalmNote *n) : note(n) {}
+    ~BitmapRelease() { if (note) std::string().swap(note->pixels); }
+};
 bool notesync_retry_unconfirmed(NoteSyncState &state) {
     bool changed=false;
     for (auto &m:state.map) if (m.pending==2 && m.google_id.empty()) { m.pending=1; changed=true; }
     return changed;
 }
-struct Remote { GoogleNote cloud; PalmNote display; bool missing=false,moved=false; };
+struct Remote { GoogleNote cloud; PalmNote display; std::array<uint32_t,2> fields={}; bool missing=false,moved=false; };
 static bool accepted(const GoogleDriveFile &f,bool drawing) {
     if (f.folder || f.trashed) return false;
     if (!drawing) return f.mime=="application/vnd.google-apps.document";
@@ -81,6 +88,25 @@ static bool write_palm(NoteSyncHost &host,uint8_t db,const Local &local,const Pa
     if (!host.release_record_buffer()) { problem="Could not release the notes record buffer"; return false; }
     return true;
 }
+static bool reload_drawing(NoteSyncHost &host,uint8_t db,const Local &snapshot,PalmNote &note,std::string &problem) {
+    HotSync_Record rec;
+    if (!hotsync_read_record(db,snapshot.id,&rec)) { problem="Could not reread the Palm drawing after validation"; return false; }
+    if (rec.truncated) {
+        size_t length=rec.total_len;
+        if (length>PALM_NOTE_RECORD_MAX || !host.reserve_record_buffer(length)) { problem="Not enough HotSync buffer to reread the Palm drawing"; return false; }
+        if (!hotsync_read_record(db,snapshot.id,&rec)) { problem="Could not reread the complete Palm drawing"; return false; }
+    }
+    if (rec.truncated || rec.id!=snapshot.id || rec.attr!=snapshot.attr || rec.category!=snapshot.category ||
+        !drawing_unpack(rec.data,rec.len,note,problem)) {
+        if (problem.empty()) problem="Palm drawing changed or became invalid after validation";
+        return false;
+    }
+    if (note_fields(note,true)!=snapshot.fields || note.header!=snapshot.note.header || note.body_word!=snapshot.note.body_word) {
+        problem="Palm drawing changed after validation; sync again"; return false;
+    }
+    if (!host.release_record_buffer()) { problem="Could not release the notes record buffer after rereading"; return false; }
+    return true;
+}
 void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &r) {
     r=NoteSyncResult(); uint8_t db=0; bool opened=false;
     auto work=[&]() {
@@ -105,12 +131,12 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
             r.problem=setup.drawing ? "Could not open npadDB. Standard Palm OS 4 Note Pad is required." : "Could not open MemoDB"; return;
         }
         opened=true;
-        std::vector<Local> local; size_t bytes=0;
+        std::vector<Local> local; size_t bytes=0,largest_bitmap=0;
         for (unsigned i=0;i<=setup.max_notes;i++) {
             HotSync_Record rec;
             if (!hotsync_read_record_by_index(db,i,&rec)) { if (hotsync_error()==HOTSYNC_DLP_NOT_FOUND) break; r.problem="Could not read all Palm notes"; return; }
             if (i==setup.max_notes) { r.problem="Palm notes exceed the configured record limit"; return; }
-            Local l; l.id=rec.id; l.attr=rec.attr; l.category=rec.category;
+            Local l={}; l.id=rec.id; l.attr=rec.attr; l.category=rec.category;
             if (!l.id || l.id>0xffffff || l.category>15 || std::any_of(local.begin(),local.end(),[&](const Local &v) { return v.id==l.id; })) { r.problem="Invalid or repeated Palm note identity"; return; }
             if (!(l.attr&(HOTSYNC_ATTR_DELETED|HOTSYNC_ATTR_SECRET|HOTSYNC_ATTR_ARCHIVED))) {
                 if (setup.drawing && rec.truncated) {
@@ -126,8 +152,11 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
                     r.problem="Palm record "+std::to_string(i)+" (ID "+std::to_string(l.id)+", "+std::to_string(rec.len)+
                         " received bytes): "+(r.problem.empty() ? "record was truncated" : r.problem); return;
                 }
-                bytes+=l.note.text.size()+l.note.title.size()+l.note.pixels.size()+l.note.header.size();
-                if (bytes>setup.content_memory) { r.problem="Palm notes exceed the content memory budget"; return; }
+                l.fields=note_fields(l.note,setup.drawing);
+                largest_bitmap=std::max(largest_bitmap,l.note.pixels.size());
+                bytes+=l.note.text.size()+l.note.title.size()+l.note.header.size();
+                if (bytes+l.note.pixels.size()>setup.content_memory) { r.problem="Palm notes exceed the content memory budget"; return; }
+                if (setup.drawing) std::string().swap(l.note.pixels);
             }
             local.push_back(std::move(l));
         }
@@ -162,15 +191,31 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
             if (!google.read(f,setup.drawing,item.cloud)) { r.problem=google.error(); return; }
             size_t original_bytes=item.cloud.note.text.size()+item.cloud.note.title.size()+item.cloud.note.pixels.size();
             if (!project(item.cloud,setup,item.display,r.problem)) return;
-            // Keep the existing conservative budget even though the drawing
-            // bitmap is now shared by ownership rather than duplicated.
-            bytes+=item.display.text.size()+item.display.title.size()+item.display.pixels.size()+original_bytes;
-            if (bytes>setup.content_memory) { r.problem="Combined notes exceed the content memory budget"; return; }
+            item.fields=note_fields(item.display,setup.drawing);
+            largest_bitmap=std::max(largest_bitmap,item.display.pixels.size());
+            // Memos retain Unicode and projected text. Drawings retain only
+            // metadata/hashes, with one bitmap charged to the working budget.
+            bytes+=item.display.text.size()+item.display.title.size()+(setup.drawing ? 0 : original_bytes);
+            if (bytes+item.display.pixels.size()>setup.content_memory) { r.problem="Combined notes exceed the content memory budget"; return; }
+            if (setup.drawing) std::string().swap(item.display.pixels);
             remote.push_back(std::move(item));
         }
         // Every accepted file now lives in the complete remote snapshot.
         // Release duplicate listing metadata before creates/updates need TLS.
         std::vector<GoogleDriveFile>().swap(files);
+        if (setup.drawing && bytes+largest_bitmap>setup.content_memory) { r.problem="Drawing metadata and active bitmap exceed the content working memory budget"; return; }
+        auto load_drawing=[&](Remote &g) {
+            if (!setup.drawing || !g.display.pixels.empty()) return true;
+            size_t bitmap=g.display.width/8*g.display.height;
+            if (bytes+bitmap>setup.content_memory) { r.problem="Drawing exceeds the content working memory budget"; return false; }
+            GoogleNote current; PalmNote display;
+            // The immutable revision from preflight prevents mixing PNGs from
+            // different edits. Verify the projection before using this payload.
+            if (!google.read(g.cloud.file,true,current)) { r.problem=google.error(); return false; }
+            if (!project(current,setup,display,r.problem)) return false;
+            if (note_fields(display,true)!=g.fields) { r.problem="Google drawing differs from the validated snapshot"; return false; }
+            g.display.pixels=std::move(display.pixels); return true;
+        };
         size_t old_size=state.map.size();
         state.map.erase(std::remove_if(state.map.begin(),state.map.end(),[&](const NoteSyncMap &m) {
             return m.pending!=1 && m.pending!=2 && std::none_of(local.begin(),local.end(),[&](const Local &l) { return l.id==m.palm_id; }) &&
@@ -189,17 +234,19 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
             if (l.attr&(HOTSYNC_ATTR_SECRET|HOTSYNC_ATTR_ARCHIVED)) { r.skipped++; continue; }
             auto g=m==state.map.end() ? remote.end() : std::find_if(remote.begin(),remote.end(),[&](const Remote &v) { return v.cloud.file.id==m->google_id; });
             if (g!=remote.end() && g->moved) { r.skipped++; continue; }
-            auto lf=note_fields(l.note,setup.drawing);
+            BitmapRelease remote_bitmap(setup.drawing && g!=remote.end() ? &g->display : nullptr);
+            auto lf=l.fields;
             if (l.attr&HOTSYNC_ATTR_DELETED) {
                 if (m!=state.map.end()) {
                     if (m->pending==2 && m->google_id.empty()) { r.problem="Resolve the pending Google creation before deleting this memo"; return; }
                     if (g!=remote.end() && !g->missing) {
-                        if (note_fields(g->display,setup.drawing)!=m->fields) {
+                        if (g->fields!=m->fields) {
                             if (!setup.conflicts) { conflict("a note being deleted on Palm"); return; }
                             if (setup.conflicts==2) {
+                                if (!load_drawing(*g)) return;
                                 Local restored=l; restored.attr&=~HOTSYNC_ATTR_DELETED;
                                 if (!write_palm(host,db,restored,g->display,setup.drawing,now,r.problem)) { if (r.problem.empty()) r.problem="Could not restore the edited Google note on Palm"; return; }
-                                m->fields=note_fields(g->display,setup.drawing); m->pending=0;
+                                m->fields=g->fields; m->pending=0;
                                 if (!checkpoint()) return;
                                 r.downloaded++; continue;
                             }
@@ -222,6 +269,8 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
                 }
             }
             bool creating=m==state.map.end() || m->pending==1 || m->pending==2;
+            if (setup.drawing && !creating && !m->pending && g!=remote.end() && !g->missing &&
+                !(l.attr&HOTSYNC_ATTR_DIRTY) && lf==m->fields && g->fields==m->fields) continue;
             if (m==state.map.end()) {
                 if (state.map.size()>=setup.max_notes) { r.problem="Notes sync map is full"; return; }
                 NoteSyncMap fresh; fresh.palm_id=l.id; fresh.fields=lf; fresh.pending=1;
@@ -254,11 +303,18 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
                     if (!google.read(fresh_cloud.file,false,fresh_cloud)) { r.problem=google.error(); return; }
                 } else { fresh_cloud.file.id=m->google_id; }
             } else { r.problem="Linked Google note is missing from the complete snapshot"; return; }
-            PalmNote target=std::move(l.note); auto rf=creating ? m->fields : note_fields(g->display,setup.drawing);
+            if (setup.drawing) {
+                size_t bitmap=l.note.width/8*l.note.height;
+                if (bytes+bitmap>setup.content_memory) { r.problem="Drawing exceeds the content working memory budget"; return; }
+                PalmNote current;
+                if (!reload_drawing(host,db,l,current,r.problem)) return;
+                l.note=std::move(current);
+            }
+            PalmNote target=std::move(l.note); auto rf=creating ? m->fields : g->fields;
             bool changed[2]={false,false};
             if (creating) {
-                if (g!=remote.end() && (!g->display.text.empty() || !g->display.pixels.empty())) {
-                    auto pending_fields=note_fields(g->display,setup.drawing);
+                if (g!=remote.end() && (!g->display.text.empty() || setup.drawing)) {
+                    auto pending_fields=g->fields;
                     if (pending_fields!=m->fields && pending_fields!=lf) { conflict("an unconfirmed new note"); return; }
                 }
                 changed[0]=true; changed[1]=setup.drawing;
@@ -268,10 +324,17 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
                     if (palm && google_changed && lf[f]!=rf[f] && !setup.conflicts) { conflict(setup.drawing ? (f ? "a drawing" : "a drawing title") : "a memo"); return; }
                     bool take_palm=palm && !(google_changed && setup.conflicts==2);
                     changed[f]=take_palm && lf[f]!=rf[f];
-                    if (!take_palm) {
+                    if (!take_palm && lf[f]!=rf[f]) {
                         if (!setup.drawing) target.text=g->display.text;
                         else if (!f) target.title=g->display.title;
-                        else { target.pixels=g->display.pixels; target.width=g->display.width; target.height=g->display.height; }
+                        else {
+                            // The Palm fingerprint/header is already checked.
+                            // Drop its pixels before decoding the chosen cloud
+                            // image, so two drawings never overlap in RAM.
+                            std::string().swap(target.pixels);
+                            if (!load_drawing(*g)) return;
+                            target.pixels=std::move(g->display.pixels); target.width=g->display.width; target.height=g->display.height;
+                        }
                     }
                 }
             }
@@ -293,15 +356,16 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
             }
             m->fields=note_fields(target,setup.drawing); m->pending=0; if (!checkpoint()) return;
         }
-        for (const auto &g:remote) {
+        for (auto &g:remote) {
             if (g.missing || g.moved) continue;
             auto m=std::find_if(state.map.begin(),state.map.end(),[&](const NoteSyncMap &v) { return v.google_id==g.cloud.file.id; });
             if (m!=state.map.end() && std::any_of(local.begin(),local.end(),[&](const Local &l) { return l.id==m->palm_id; })) continue;
+            BitmapRelease remote_bitmap(setup.drawing ? &g.display : nullptr);
             // A vanished record without a deletion tombstone is reimported.
             if (m!=state.map.end() && m->pending && m->pending!=3) { r.problem="A pending outgoing note is no longer on Palm"; return; }
             if (m==state.map.end()) {
                 if (state.map.size()>=setup.max_notes) { r.problem="Notes sync map is full"; return; }
-                NoteSyncMap imported; imported.google_id=g.cloud.file.id; imported.fields=note_fields(g.display,setup.drawing); imported.pending=3;
+                NoteSyncMap imported; imported.google_id=g.cloud.file.id; imported.fields=g.fields; imported.pending=3;
                 uint32_t id=(host.random()&0xffffffu); if (!id) id=1;
                 for (unsigned tries=0;tries<=setup.max_notes*2;tries++,id=id==0xffffff ? 1 : id+1) {
                     if (std::none_of(local.begin(),local.end(),[&](const Local &l) { return l.id==id; }) && std::none_of(state.map.begin(),state.map.end(),[&](const NoteSyncMap &v) { return v.palm_id==id; })) { imported.palm_id=id; break; }
@@ -309,10 +373,11 @@ void notesync_run(const NoteSyncSetup &setup,NoteSyncHost &host,NoteSyncResult &
                 if (!imported.palm_id) { r.problem="Could not reserve a Palm note ID"; return; }
                 state.map.push_back(imported); m=state.map.end()-1; if (!checkpoint()) return;
             }
-            m->pending=3; m->fields=note_fields(g.display,setup.drawing); if (!checkpoint()) return;
-            Local fresh={m->palm_id,0,0,PalmNote()};
+            m->pending=3; m->fields=g.fields; if (!checkpoint()) return;
+            if (!load_drawing(g)) return;
+            Local fresh={m->palm_id,0,0,PalmNote(),{}};
             if (!write_palm(host,db,fresh,g.display,setup.drawing,now,r.problem)) { if (r.problem.empty()) r.problem="Could not import the Google note"; return; }
-            m->pending=0; m->fields=note_fields(g.display,setup.drawing); if (!checkpoint()) return; r.downloaded++;
+            m->pending=0; m->fields=g.fields; if (!checkpoint()) return; r.downloaded++;
         }
     };
     work(); r.link_lost=hotsync_error()==HOTSYNC_ERR_LINK;

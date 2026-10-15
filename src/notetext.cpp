@@ -6,9 +6,9 @@ static unsigned u16(const uint8_t *p) { return (p[0]<<8)|p[1]; }
 static uint32_t u32(const uint8_t *p) { return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|(p[2]<<8)|p[3]; }
 static void p16(uint8_t *p,unsigned n) { p[0]=n>>8; p[1]=n; }
 static void p32(uint8_t *p,uint32_t n) { p[0]=n>>24; p[1]=n>>16; p[2]=n>>8; p[3]=n; }
-static uint32_t hash(const std::string &s) { uint32_t h=2166136261u; for (unsigned char c:s) { h^=c; h*=16777619u; } return h; }
+static uint32_t hash(const std::string &s,uint32_t h=2166136261u) { for (unsigned char c:s) { h^=c; h*=16777619u; } return h; }
 std::array<uint32_t,2> note_fields(const PalmNote &n,bool drawing) {
-    return {{hash(drawing ? n.title : n.text),drawing ? hash(n.pixels+":"+std::to_string(n.width)+":"+std::to_string(n.height)) : 0}};
+    return {{hash(drawing ? n.title : n.text),drawing ? hash(":"+std::to_string(n.width)+":"+std::to_string(n.height),hash(n.pixels)) : 0}};
 }
 bool memo_unpack(const uint8_t *p,size_t size,PalmNote &n,std::string &problem) {
     n=PalmNote(); if (!size) { problem="Memo has no NUL terminator"; return false; }

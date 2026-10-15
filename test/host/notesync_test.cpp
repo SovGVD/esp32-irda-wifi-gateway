@@ -8,7 +8,42 @@
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
+#include <new>
+#include <cstdlib>
 #include "data/notes_png_fixtures.h"
+
+// Track live C++ allocations during a whole sync, including strings/vectors
+// retained between image downloads. Fixtures already in the mock server are
+// outside this measurement, like files stored remotely on Google Drive.
+static struct { void *p; size_t bytes; } measured[8192];
+static bool measure_memory=false;
+static size_t measured_live=0,measured_peak=0;
+void *operator new(size_t n) {
+    void *p=malloc(n ? n : 1); if (!p) throw std::bad_alloc();
+    if (measure_memory) {
+        bool added=false;
+        for (auto &entry:measured) if (!entry.p) { entry={p,n}; added=true; break; }
+        assert(added); measured_live+=n; measured_peak=std::max(measured_peak,measured_live);
+    }
+    return p;
+}
+static void unmeasure(void *p) {
+    if (p) for (auto &entry:measured) if (entry.p==p) { measured_live-=entry.bytes; entry={}; break; }
+}
+void *operator new[](size_t n) { return ::operator new(n); }
+void operator delete(void *p) noexcept { unmeasure(p); free(p); }
+void operator delete[](void *p) noexcept { ::operator delete(p); }
+void operator delete(void *p,size_t) noexcept { ::operator delete(p); }
+void operator delete[](void *p,size_t) noexcept { ::operator delete(p); }
+static void memory_begin() {
+    for (auto &entry:measured) entry={};
+    measured_live=measured_peak=0; measure_memory=true;
+}
+static void memory_end() { measure_memory=false; }
+static size_t tracked_bytes(void *p) {
+    for (const auto &entry:measured) if (entry.p==p) return entry.bytes;
+    return 0;
+}
 
 static int fd=-1;
 static std::function<bool(size_t)> test_reserve;
@@ -224,6 +259,14 @@ static std::string gray_png(PalmNote &expected) {
 }
 static std::string unhex(const char *p) { std::string s; for (size_t i=0;p[i];i+=2) { char b[3]={p[i],p[i+1],0}; s+=(char)strtoul(b,nullptr,16); } return s; }
 int main(int argc,char **argv) {
+    // Preserve the persisted v1 fingerprints without constructing another
+    // bitmap-sized string for the ":width:height" suffix.
+    PalmNote fingerprint; fingerprint.title="Hash fixture"; fingerprint.width=24; fingerprint.height=1;
+    fingerprint.pixels=std::string("\x80\0\xff",3);
+    assert((note_fields(fingerprint,true)==std::array<uint32_t,2>{{0xefced144,0x41569abb}}));
+    fingerprint.width=160; fingerprint.height=1600; fingerprint.pixels.assign(32000,0);
+    memory_begin(); note_fields(fingerprint,true); memory_end(); assert(measured_peak<128);
+    fingerprint=PalmNote();
     for (const auto &fixture:png_fixtures) {
         PalmNote bitmap; std::string problem;
         assert(note_read_png(unhex(fixture.png),bitmap,problem) && bitmap.pixels==unhex(fixture.pixels));
@@ -395,7 +438,9 @@ int main(int argc,char **argv) {
     assert(short_image.problem.find("Download PNG")!=std::string::npos && server.mutations==mutations);
     assert(get("npadDB",palm_sketch,n,true) && n.height==480 && n.header==alarm);
     r=sync(drawing,notes);
-    assert(r.downloaded==1 && server.binary_downloads[sketch]==downloads+2);
+    // Failed preflight, successful preflight, then the one changed image is
+    // reloaded from its immutable revision for installation.
+    assert(r.downloaded==1 && server.binary_downloads[sketch]==downloads+3);
     assert(get("npadDB",palm_sketch,n,true) && n.height==352 && n.pixels==grayscale.pixels && n.header.substr(30)==alarm.substr(30));
     // The enlarged native buffer is released after the write and before the
     // next network operation; a failed release stops before cloud transfers.
@@ -434,6 +479,57 @@ int main(int argc,char **argv) {
     auto invalid=server.add("Broken.png",drawing.state.folder,"not a PNG",drawing.now()).id; mutations=server.mutations; sync(drawing,notes,false); assert(server.mutations==mutations); server.files.erase(invalid);
     auto broken=note_png(decoded); broken.back()^=1; assert(!note_read_png(broken,decoded,problem));
     auto corrupt=record(n); corrupt.pop_back(); assert(!drawing_unpack((const uint8_t *)corrupt.data(),corrupt.size(),decoded,problem));
+    // A book larger than the old aggregate bitmap budget is still handled
+    // with one active image. No decoded payload from an earlier image may
+    // remain live at the next download. Each file is independently validated
+    // before the transfer pass; unchanged notes need no second download.
+    PalmNote page; page.width=160; page.height=352; page.pixels.assign(7040,0);
+    for (size_t i=0;i<page.pixels.size();i++) page.pixels[i]=(char)(i%2 ? 0xaa : 0x55);
+    std::vector<std::string> pages;
+    for (unsigned i=0;i<8;i++) pages.push_back(server.add("Page "+std::to_string(i)+".png",drawing.state.folder,note_png(page),drawing.now()).id);
+    size_t low=SIZE_MAX,high=0; auto check_buffer=server.before_download;
+    server.before_download=[&]() { check_buffer(); low=std::min(low,measured_live); high=std::max(high,measured_live); };
+    memory_begin(); r=sync(drawing,notes); memory_end();
+    printf("Drawing import memory: peak %zu, between downloads %zu..%zu\n",measured_peak,low,high);
+    assert(r.downloaded==pages.size() && high-low<24000);
+    for (const auto &id:pages) {
+        auto mapping=std::find_if(drawing.state.map.begin(),drawing.state.map.end(),[&](const NoteSyncMap &m) { return m.google_id==id; });
+        assert(mapping!=drawing.state.map.end() && get("npadDB",mapping->palm_id,n,true) && n.pixels==page.pixels && n.height==352);
+    }
+    low=SIZE_MAX; high=0;
+    memory_begin(); r=sync(drawing,notes); memory_end();
+    size_t transport_bytes=tracked_bytes(memory.data());
+    printf("Drawing repeat memory: peak %zu, between downloads %zu..%zu, retained %zu (HotSync buffer %zu)\n",measured_peak,low,high,measured_live,transport_bytes); fflush(stdout);
+    // The reusable protocol buffer may have been shrunk during this sync.
+    // It is the only allowed surviving allocation; no image payload remains.
+    assert(!r.uploaded && !r.downloaded && high-low<24000 && measured_live==transport_bytes);
+    for (const auto &id:pages) assert(server.binary_downloads[id]==3); // preflight + install, then preflight only
+    server.before_download=check_buffer;
+    // Re-reading compact Palm snapshots must not overwrite a record edited
+    // after validation. The cloud change forces an actual transfer decision.
+    PalmNote original_palm; assert(get("npadDB",palm_sketch,original_palm,true));
+    auto cloud_edit=original_palm; cloud_edit.pixels[0]^=1;
+    server.files[sketch].data=note_png(cloud_edit); server.commit(server.files[sketch]);
+    bool raced=false;
+    server.before_download=[&]() {
+        check_buffer();
+        if (!raced) { raced=true; auto edited=original_palm; edited.title="Mid-sync Palm edit"; put("npadDB",palm_sketch,record(edited)); }
+    };
+    mutations=server.mutations; auto race=sync(drawing,notes,false);
+    assert(raced && race.problem.find("after validation")!=std::string::npos && server.mutations==mutations);
+    assert(get("npadDB",palm_sketch,n,true) && n.title=="Mid-sync Palm edit");
+    server.before_download=check_buffer;
+    put("npadDB",palm_sketch,record(original_palm),0); sync(drawing,notes);
+    assert(get("npadDB",palm_sketch,n,true) && n.pixels==cloud_edit.pixels && n.title==original_palm.title);
+    // A bad later image must stop the complete validation pass before any
+    // earlier valid incoming note is installed or a Palm edit is uploaded.
+    auto later=server.add("ZZ invalid.png",drawing.state.folder,"not a PNG",drawing.now()).id;
+    auto uninstalled=server.add("Valid incoming.png",drawing.state.folder,note_png(page),drawing.now()).id;
+    auto before_state=drawing.state.map; mutations=server.mutations;
+    sync(drawing,notes,false);
+    assert(server.mutations==mutations && drawing.state.map.size()==before_state.size());
+    assert(std::none_of(drawing.state.map.begin(),drawing.state.map.end(),[&](const NoteSyncMap &m) { return m.google_id==uninstalled; }));
+    server.files.erase(later); server.files.erase(uninstalled);
     // State blobs must not accept duplicated identities or incomplete data.
     std::string state; assert(notesync_encode(drawing.state,state)); NoteSyncState parsed;
     for (size_t i=0;i<state.size();i++) assert(!notesync_decode(state.substr(0,i),64,parsed));

@@ -170,7 +170,8 @@ bool note_read_png(const std::string &png,PalmNote &n,std::string &problem) {
     bool low_memory=false; valid=inflate_rows(PngInput(p,data_first,data_end,data_size),(row_bytes+1)*height,sink,low_memory);
     if (low_memory) {
         problem="Not enough memory to decode the PNG image ("+std::to_string(width)+"x"+std::to_string(height)+
-            ", "+std::to_string(depth)+"-bit, "+std::to_string(channels)+" channels). Try a 1-bit monochrome PNG";
+            ", "+std::to_string(depth)+"-bit, "+std::to_string(channels)+" channels)";
+        if (depth!=1 || type!=0) problem+=". Try a 1-bit monochrome PNG";
         return false;
     }
     if (!valid || row!=height || pos) return fail("Invalid, truncated or oversized PNG image stream");

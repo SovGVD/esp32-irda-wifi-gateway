@@ -98,6 +98,8 @@ int main() {
         assert(!decode(gray,out,error,32768,fail) && error.find("Not enough memory")!=std::string::npos);
         assert(error.find("160x160, 8-bit, 1 channels")!=std::string::npos);
     }
+    PalmNote mono; mono.pixels.assign(3200,0); auto mono_png=note_png(mono);
+    assert(!decode(mono_png,out,error,32768,2) && error.find("Not enough memory")!=std::string::npos && error.find("Try a 1-bit")==std::string::npos);
     auto exact_window=raster(127,256,1,pixels);
     assert(exact_window.size()==32768);
     assert(decode(image(127,256,0,exact_window,997),out,error) && out.pixels==pixels && largest_workspace==32768);

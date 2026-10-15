@@ -34,7 +34,7 @@ Firmware settings are in [`include/config.h`](../include/config.h). Google scope
 | `CALENDAR_HTTP_TIMEOUT_MS` / `CALENDAR_HTTP_RESPONSE_MAX` | 12000 / 32000 | Calendar HTTPS timeout and response byte limit |
 | `CONTACTS_MAX_PER_SYNC` | 64 | Maximum Google, linked and relevant Palm contacts; the combined public book must also fit |
 | `CONTACTS_HTTP_TIMEOUT_MS` / `CONTACTS_HTTP_RESPONSE_MAX` | 12000 / 32000 | Contacts HTTPS timeout and response byte limit |
-| `NOTES_MAX_PER_SYNC` / `NOTES_CONTENT_MEMORY` | 64 / 64000 | Memo/Note record count and combined content byte budget, per conduit |
+| `NOTES_MAX_PER_SYNC` / `NOTES_CONTENT_MEMORY` | 64 / 64000 | Memo/Note record count and retained-content budget, per conduit; Memo holds combined text, while Note Pad holds metadata plus one active bitmap |
 | `NOTES_HTTP_TIMEOUT_MS` / `NOTES_HTTP_RESPONSE_MAX` | 20000 / 32768 | Memo/Note HTTPS timeout and response byte limit |
 | `EXPENSES_MAX_PER_SYNC` / `EXPENSES_CONTENT_MEMORY` | 64 / 24000 | Expense record/row count and combined Palm/Sheets content byte budget |
 | `EXPENSES_HTTP_TIMEOUT_MS` / `EXPENSES_HTTP_RESPONSE_MAX` | 20000 / 48000 | Expenses HTTPS timeout and response byte limit |

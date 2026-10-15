@@ -209,6 +209,7 @@ if ! "$out/notesync_test" "$tty" > "$out/notes.out" 2>&1; then
 fi
 wait "$palm_pid"
 grep -q '^done$' "$out/notes.out" && grep -q '"ok": true' "$out/notes.json"
+grep '^Drawing .* memory:' "$out/notes.out"
 echo "notesync: all passed (two-way MemoDB/Docs and OS 4 npadDB/PNG, conflicts, deletion, private records, journals, malformed input)"
 
 # Classic ExpenseDB and Google Sheets, over the real HotSync protocol.

@@ -199,7 +199,7 @@
 
 // Memo Pad / Google Docs and Palm OS 4 Note Pad / Drive PNG sync.
 #define NOTES_MAX_PER_SYNC         64
-#define NOTES_CONTENT_MEMORY       64000
+#define NOTES_CONTENT_MEMORY       64000 // retained content; drawings keep metadata + one active bitmap
 #define NOTES_HTTP_TIMEOUT_MS      20000
 #define NOTES_HTTP_RESPONSE_MAX    32768
 
