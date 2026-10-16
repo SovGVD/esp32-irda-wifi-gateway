@@ -112,9 +112,18 @@
 #define PROXY_ALL_SITES_DEFAULT 1                // Setting until changed in the portal
 
 // Xiino can instead send every request to a "DataServer" (its preferences).
-// The original one is gone; the adapter answers under its name. Clearing the
-// DataServer setting in Xiino is the better choice: pages then display cleanly.
+// The original one is gone; the adapter implements OpenXiino's DataServer
+// protocol under its name, including embedded colour mode 9 images.
 #define XIINO_DATASERVER_HOST "pds.mobirus.com"  // Xiino's default; lower case
+#define XIINO_DATASERVER_LEGACY_HOST "pds.ilinx.com"
+#define XIINO_DATASERVER_PORT 4040
+#define XIINO_MAX_SOURCE_BYTES (2 * 1024 * 1024) // Raw scan budget; not retained in RAM
+#define XIINO_MAX_IMAGE_BYTES 64000
+#define XIINO_MAX_IMAGE_PIXELS (153 * 1024)
+#define XIINO_PAGE_TIMEOUT_MS 20000
+#define XIINO_IMAGE_TIMEOUT_MS 3000
+#define XIINO_IMAGES_TIMEOUT_MS 8000
+#define XIINO_MAX_IMAGES 8
 #define PROXY_MAX_PAGE_BYTES  48000              // Longer pages are cut off
 #define PROXY_MAX_REDIRECTS   4
 #define PROXY_TIMEOUT_MS      12000              // Connecting, and waiting for data

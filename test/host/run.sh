@@ -11,6 +11,8 @@ out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 flags="-std=c++17 -Wall -Wextra -O1 -g -fsanitize=address,undefined -I$root/include"
 
+sh "$here/xiino.sh"
+
 g++ $flags -o "$out/syncdiagnostics_test" "$here/syncdiagnostics_test.cpp" "$root/src/syncdiagnostics.cpp"
 "$out/syncdiagnostics_test"
 

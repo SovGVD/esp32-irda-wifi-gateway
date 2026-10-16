@@ -5,7 +5,7 @@
 The same firmware also works as a small router: when the Palm opens a network connection over IR, the ESP32-C3 answers the PPP session itself and passes the Palm's traffic onto Wi-Fi (NAT). No Linux host is involved; the adapter only needs USB power. HotSync keeps working unchanged, because the firmware looks at the first byte the Palm sends on each connection (PPP starts with `0x7E`, HotSync with `0xBE`) and routes the session to Wi-Fi or to USB accordingly.
 
 > [!NOTE]
-> HotSync (backup and install), the PPP connection, the portal and joining a Wi-Fi network have been used with a real Palm IIIx running the Xiino browser. The web proxy is newer and has so far only been checked in host-side tests, not on hardware.
+> HotSync (backup and install), the PPP connection, the portal and joining a Wi-Fi network have been used with a real Palm IIIx running the Xiino browser. The user confirmed the OpenXiino about page displays, then reported Wikipedia's source limit, a long Receiving stage and Google's logo appearing as an unsupported image. The source-limit, streaming and image fixes have host-test and firmware-build coverage; those external pages still need a Palm retest.
 
 ## 1. Configure the Palm
 
@@ -48,7 +48,7 @@ Each network gets two tries, the second at reduced transmit power, because many 
 
 Once the status page shows "connected", the Palm is online. Keep the IR ports aligned while the connection is in use, and tap **Disconnect** in Prefs → Network when done.
 
-Palm-era browsers only speak plain `http://`, and almost every site today answers that with "use https". The adapter therefore has a **web proxy**, on by default:
+For **Xiino**, use the DataServer settings below. For browsers fetching pages directly, the adapter has a **web proxy**, on by default:
 
 - The adapter answers every site name with its own address, so the browser's requests come to it.
 - It fetches the page over Wi-Fi, following redirects onto HTTPS, and passes the HTML to the Palm.
@@ -61,7 +61,27 @@ Sites made for old or small browsers work best, for example `http://frogfind.com
 
 ## Xiino
 
-Xiino by default sends every request to a "DataServer" (`pds.mobirus.com`) that no longer exists, which shows as "Host does not exist" for every address. **Clear the DataServer setting in Xiino's preferences**: Xiino then fetches pages directly and displays them cleanly. If it is left set, the adapter answers in the DataServer's place and browsing still works, but Xiino shows a line of stray characters at the top of every page, because it expects the DataServer's own page format.
+The adapter now implements the [OpenXiino](https://github.com/nicl83/OpenXiino) DataServer protocol in firmware. No additional computer or Python server is needed.
+
+1. In Xiino's **Options → Prefs → DataServer**, keep/set **`pds.mobirus.com`**, or enter **`192.168.99.1:4040`**. `pds.ilinx.com` is also recognized. If the setting was previously cleared, restore it.
+2. Open **`http://about/`**. The built-in OpenXiino page includes its embedded logo and works before Wi-Fi is connected. **`http://deviceinfo/`** displays the width, colour/grayscale depth and encoding Xiino requested.
+3. Open **`http://wifi.setup/`** to configure Wi-Fi, then browse normally. Leave the IR ports aligned while pages and pictures transfer.
+
+Xiino requests receive their binary DataServer prefix, supported HTML and converted pictures embedded in the proprietary `EBDIMAGE` format. Anchor links are made absolute using the final page address after redirects; HTTPS anchor links are rewritten as HTTP as upstream does. The adapter follows origin redirects onto HTTPS. The portal and error pages also receive DataServer framing.
+
+DataServer mode works with the portal's general **web proxy switched off**: only the two old DataServer hostnames and the portal name need local DNS answers. Other applications can then resolve their real servers normally. The server listens on both port 80 and 4040 and retains the existing Palm-only access restriction.
+
+This port retains upstream's colour mode 9 images even for grayscale requests and its existing HTML/compression quirks. It does not run modern JavaScript. Static WebP (lossy/lossless), PNG, JPEG, GIF (first frame) and BMP images are supported. PNG/GIF are decoded into small thumbnails, WebP uses decoder scaling, and JPEG/BMP use native-channel decoding. Animated WebP and SVG are unsupported. Small inline `data:image/...` images are accepted within the existing tag/source budgets. Resampling/quantization can differ from Pillow.
+
+Modern pages are filtered as they arrive: scripts, stylesheet text, comments and unused modern attributes are discarded before retaining the source. The raw scan budget is 2 MiB; compacted source and total output each stay within 48,000 bytes. Converted HTML is sent in small blocks, with a flush before each optional image request, rather than waiting for all pictures and assembling another complete HTML page. Embedded image data follows the HTML, as in OpenXiino. The HTTP/1.0 response ends when the connection closes. Xiino may still wait for the complete response before drawing it; the slow IR transfer remains part of Receiving.
+
+Origin pages have a 20-second download deadline. Each optional image download has a 3-second deadline; image attempts share an 8-second elapsed budget and an eight-image count cap. This prevents repeated slow picture servers from holding up the page indefinitely. These image checks include elapsed conversion/delivery time between attempts, so a slow link can cause later optional pictures to be omitted. Cancelled/blocked Palm connections stop delivery rather than continuing image downloads.
+
+If useful content exceeds the source/output bounds, the page is marked **[Page shortened to fit the Palm]**. Image files are limited to 64,000 bytes, decoder allocations to a shared 192 KiB with a 24 KiB free-heap reserve, and source dimensions to 2048×2048. PNG/GIF thumbnail decoding avoids the old full-frame RGBA copies; larger JPEG/BMP or complex WebP images can still exceed available memory. Placeholders distinguish memory limits, unavailable downloads and unrecognized/invalid formats. See [dependency and port details](../third_party/README.md).
+
+The portal's **Diagnostics** page records the last Xiino request's duration, raw bytes, sent bytes, image attempts and network error, plus the last image's dimensions, decoder peak/live allocation and decoder error. These readings help distinguish a slow server, image-memory failure and a stalled Palm transfer.
+
+Unlike the older direct proxy, the DataServer's HTTPS fetches check origin certificates with the firmware CA bundle and use the existing network clock. The Palm-to-adapter connection is still plain HTTP over PPP.
 
 ## Notes
 

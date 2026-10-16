@@ -8,7 +8,7 @@ An **ESP32-C3** and **Vishay TFBS4711** infrared transceiver connect a vintage P
 ## Features
 
 - **Desktop HotSync:** back up, install and restore Palm applications and databases over USB with `pilot-link` or `jpilot`.
-- **Internet access:** connect the Palm over infrared to Wi-Fi, with a settings portal, web proxy and Xiino support.
+- **Internet access:** connect the Palm over infrared to Wi-Fi, with a settings portal, web proxy and an embedded OpenXiino DataServer for Xiino pages and pictures.
 - **Mail:** send and receive through IMAP/SMTP, including Gmail with Google sign-in, and sync read/deleted messages.
 - **Google Tasks:** sync the Palm's To Do List in both directions.
 - **Google Calendar:** sync Date Book appointments, notes, alarms and supported repeat rules.

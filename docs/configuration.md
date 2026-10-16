@@ -17,8 +17,15 @@ Firmware settings are in [`include/config.h`](../include/config.h). Google scope
 | `WIFI_SSID` / `WIFI_PASSWORD` | empty | Default Wi-Fi network until one is chosen in the portal |
 | `WIFI_TX_POWER` | not set | Reduced Wi-Fi transmit power for boards that need it |
 | `PROXY_ALL_SITES_DEFAULT` | 1 | Web proxy on or off until changed in the portal |
-| `PROXY_MAX_PAGE_BYTES` | 48000 | Longer pages are cut off |
-| `XIINO_DATASERVER_HOST` | `pds.mobirus.com` | Name under which the adapter stands in for Xiino's DataServer |
+| `PROXY_MAX_PAGE_BYTES` | 48000 | Direct proxy truncation limit; Xiino compacted-source and output byte budgets (oversized pages are shortened with a notice) |
+| `XIINO_DATASERVER_HOST` / `XIINO_DATASERVER_LEGACY_HOST` | `pds.mobirus.com` / `pds.ilinx.com` | Names resolved locally for the OpenXiino DataServer, also with the general proxy off |
+| `XIINO_DATASERVER_PORT` | 4040 | Additional DataServer listener; port 80 also accepts Xiino requests |
+| `XIINO_MAX_SOURCE_BYTES` | `2 * 1024 * 1024` | Raw page scan budget; streamed through a filter, not retained in RAM |
+| `XIINO_MAX_IMAGE_BYTES` | 64000 | Maximum compressed image download |
+| `XIINO_MAX_IMAGE_PIXELS` | `153 * 1024` | Resized image pixel cap; shared 192 KiB decoder allocation budget and free-heap checks can reject smaller images |
+| `XIINO_PAGE_TIMEOUT_MS` | 20000 | Total origin page download deadline, including redirects and reads |
+| `XIINO_IMAGE_TIMEOUT_MS` | 3000 | Deadline for each optional image download |
+| `XIINO_IMAGES_TIMEOUT_MS` / `XIINO_MAX_IMAGES` | 8000 / 8 | Shared elapsed image-attempt budget and maximum attempted images per page |
 | `PPP_GATEWAY_IP` / `PPP_PALM_IP` | `192.168.99.1` / `.2` | Addresses on the link between adapter and Palm |
 | `MAIL_PC_ANSWER_TIMEOUT_MS` | 1500 | How long a HotSync waits for a desktop on USB before standalone Drive / Mail / Tasks / Calendar / Contacts sync |
 | `MAIL_DEFAULT_IMAP_SERVER` / `MAIL_DEFAULT_SMTP_SERVER` | Gmail's | Mail servers until others are entered in the portal |

@@ -10,6 +10,7 @@
 #include "irexpenses.h"
 #include "irhotsync.h"
 #include "irdebug.h"
+#include "irxiino.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -81,6 +82,7 @@ static String s_request_host;      // Site the browser asked for (address or Hos
 static String s_request_agent;     // Browser identification, passed on by the proxy
 static String s_request_method;    // GET or POST
 static String s_request_body;      // Form fields of a POST, passed on by the proxy
+static XiinoRequest s_xiino_request;
 
 // Google sign-in from a PC: the sign-in pages answer on the Wi-Fi side while
 // this is open (opened from the Palm's Mail page, for GOOGLE_SETUP_WINDOW_MS)
@@ -516,9 +518,7 @@ static String request_sole_field(const char *name) {
 }
 
 // Returns false once the browser has gone away
-static bool send_all(const String &text) {
-    const char *data = text.c_str();
-    size_t left = text.length();
+static bool send_bytes(const char *data, size_t left) {
     while (left > 0) {
         int sent = send(s_client, data, left, 0);
         if (sent <= 0) {
@@ -530,12 +530,22 @@ static bool send_all(const String &text) {
     return true;
 }
 
-static void respond(const char *status, const char *content_type, const String &body) {
+static bool send_all(const String &text) {
+    return send_bytes(text.c_str(), text.length());
+}
+
+static void respond_bytes(const char *status, const char *content_type, const char *body, size_t length) {
     // Plain HTTP/1.0: one reply, exact length, then the connection is closed
     String headers = String("HTTP/1.0 ") + status + "\r\nContent-Type: " + content_type +
-                     "\r\nContent-Length: " + String((unsigned)body.length()) +
+                     "\r\nContent-Length: " + String((unsigned)(length + (s_xiino_request.dataserver ? 16 : 0))) +
                      "\r\nPragma: no-cache\r\nConnection: close\r\n\r\n";
-    send_all(headers + body);
+    if (!send_all(headers)) return;
+    if (s_xiino_request.dataserver && !send_bytes(xiino_padding().data(), xiino_padding().size())) return;
+    send_bytes(body, length);
+}
+
+static void respond(const char *status, const char *content_type, const String &body) {
+    respond_bytes(status, content_type, body.c_str(), body.length());
 }
 
 class Page {
@@ -712,12 +722,14 @@ static void handle_status() {
     }
 
     if (s_proxy_all_sites) {
-        page.line("Web proxy: on. Pages are fetched by the adapter, so https sites work; pictures are left out.");
+        page.line("Web proxy: on. Direct browser pages omit pictures. Xiino DataServer includes converted pictures.");
         page.link("/proxy/0", "Turn web proxy off");
     } else {
         page.line("Web proxy: off. The Palm connects to sites itself: plain http only, but other programs (mail, telnet) work.");
         page.link("/proxy/1", "Turn web proxy on");
     }
+    page.line("Xiino DataServer: " XIINO_DATASERVER_HOST " (OpenXiino).");
+    page.link("http://about/", "About OpenXiino (Xiino DataServer mode)");
 
     const IrMailSettings &mail = irmail_settings();
     page.link("/mail", mail.address.length() == 0 ? String("Mail: not set up")
@@ -862,6 +874,8 @@ static void show_esp_status(Page &page,const multi_heap_info_t &heap,uint64_t up
     page.line("Heap free: "+diagnostic_bytes(heap.total_free_bytes));
     page.line("Lowest free heap since boot: "+diagnostic_bytes(heap.minimum_free_bytes));
     page.line("Largest allocatable heap block: "+diagnostic_bytes(heap.largest_free_block));
+    page.line(String(irxiino_diagnostics().c_str()));
+    page.line(String(xiino_image_diagnostics().c_str()));
     if (ESP.getPsramSize()) {
         page.line("PSRAM total: "+diagnostic_bytes(ESP.getPsramSize())+"; free: "+diagnostic_bytes(ESP.getFreePsram()));
     } else page.line("PSRAM: not available");
@@ -1529,8 +1543,7 @@ static bool serve_pc_request() {
 // the page over Wi-Fi (following redirects onto HTTPS), strips what the Palm
 // cannot use, and passes the HTML on.
 //
-// The same code serves Xiino's "DataServer" mode, where the browser sends every
-// request to one server as GET /<display settings>/?<real address>.
+// Xiino's DataServer requests are handled separately by the OpenXiino port.
 
 struct ProxyUrl {
     bool https;
@@ -2008,6 +2021,24 @@ static void route_request() {
         site = site.substring(0, port);
     }
     site.toLowerCase();
+    if (s_xiino_request.dataserver && site != PORTAL_DOMAIN && site != PPP_GATEWAY_IP) {
+        if (s_request_method != "GET") {
+            respond("501 Not Implemented", "text/html", "<HTML><BODY>Unsupported method</BODY></HTML>");
+        } else if (WiFi.status() == WL_CONNECTED || !xiino_builtin(s_xiino_request, "").empty()) {
+            std::string problem;
+            bool started=false;
+            bool ok=irxiino_stream(s_xiino_request,s_request_text.c_str(),[&]() {
+                started=true;
+                return send_all("HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n") &&
+                    send_bytes(xiino_padding().data(),xiino_padding().size());
+            },send_bytes,problem);
+            if (!ok && !started) proxy_error(s_target,String(problem.c_str()));
+        } else {
+            s_request_host = site;
+            handle_other_site();
+        }
+        return;
+    }
     if (site.length() > 0 && site != PORTAL_DOMAIN && site != PPP_GATEWAY_IP && site != XIINO_DATASERVER_HOST) {
         if (WiFi.status() == WL_CONNECTED) {
             proxy_fetch(scheme >= 0 ? s_target : "http://" + s_request_host + s_target);
@@ -2190,6 +2221,7 @@ static String header_value(const String &request_lower, const char *name) {
 }
 
 static void serve_client() {
+    s_xiino_request = XiinoRequest();
     // Read until the blank line that ends the headers. Old clients may use bare
     // line feeds, send no headers at all (HTTP/0.9), or close their side early.
     static char raw[HTTP_REQUEST_MAX + 1];
@@ -2261,15 +2293,10 @@ static void serve_client() {
     int second_space = line.indexOf(' ', first_space + 1);
     s_target = (second_space >= 0) ? line.substring(first_space + 1, second_space) : line.substring(first_space + 1);
 
-    // Xiino asks its DataServer for "/<display settings>/?<real address>":
-    // the real address is what counts
-    int real = s_target.indexOf("?http://");
-    if (real < 0) {
-        real = s_target.indexOf("?https://");
-    }
-    if (real >= 0) {
-        s_target = s_target.substring(real + 1);
-    }
+    // Preserve DataServer settings and response framing; local portal pages
+    // still route normally after extracting their real address.
+    s_xiino_request = xiino_request(s_target.c_str());
+    if (s_xiino_request.dataserver) s_target = s_xiino_request.url.c_str();
 
     // Form fields: after the "?" of the address, and / or in the body
     int query = s_target.indexOf('?');
@@ -2333,8 +2360,16 @@ static void http_task(void *arg) {
     local.sin_port = htons(80);
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     if (listener < 0 || bind(listener, (struct sockaddr *)&local, sizeof(local)) < 0 || listen(listener, 2) < 0) {
+        if (listener >= 0) close(listener);
         vTaskDelete(NULL);
         return;
+    }
+    int xiino_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    local.sin_port = htons(XIINO_DATASERVER_PORT);
+    if (xiino_listener < 0 || bind(xiino_listener, (struct sockaddr *)&local, sizeof(local)) < 0 || listen(xiino_listener, 2) < 0) {
+        if (xiino_listener >= 0) close(xiino_listener);
+        xiino_listener = -1;
+        irdbg_printf("Xiino: could not listen on port %u", XIINO_DATASERVER_PORT);
     }
 
     for (;;) {
@@ -2344,14 +2379,16 @@ static void http_task(void *arg) {
         fd_set readable;
         FD_ZERO(&readable);
         FD_SET(listener, &readable);
+        if (xiino_listener >= 0) FD_SET(xiino_listener, &readable);
         struct timeval wait = {0, 200 * 1000};
-        if (select(listener + 1, &readable, NULL, NULL, &wait) <= 0) {
+        if (select((xiino_listener > listener ? xiino_listener : listener) + 1, &readable, NULL, NULL, &wait) <= 0) {
             continue;
         }
 
         struct sockaddr_in peer = {};
         socklen_t peer_len = sizeof(peer);
-        s_client = accept(listener, (struct sockaddr *)&peer, &peer_len);
+        int ready_listener = FD_ISSET(listener, &readable) ? listener : xiino_listener;
+        s_client = accept(ready_listener, (struct sockaddr *)&peer, &peer_len);
         if (s_client < 0) {
             continue;
         }
@@ -2359,6 +2396,8 @@ static void http_task(void *arg) {
 
         struct timeval timeout = {HTTP_READ_TIMEOUT_S, 0};
         setsockopt(s_client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        struct timeval send_timeout = {PROXY_TIMEOUT_MS / 1000, (PROXY_TIMEOUT_MS % 1000) * 1000};
+        setsockopt(s_client, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
         serve_client();
 
         // Finish our side, then wait for the client to close. Closing with unread
@@ -2515,11 +2554,13 @@ static void dns_task(void *arg) {
                     pkt[2] |= DNS_FLAG_RESPONSE;
                     pkt[3] = 0x80 | DNS_RCODE_SERVFAIL;
                     sendto(sock, pkt, len, 0, (struct sockaddr *)&from, from_len);
-                } else if (strcmp(name, PORTAL_DOMAIN) == 0 || strcmp(name, XIINO_DATASERVER_HOST) == 0 || !wifi_up ||
+                } else if (strcmp(name, PORTAL_DOMAIN) == 0 || strcmp(name, XIINO_DATASERVER_HOST) == 0 ||
+                           strcmp(name, XIINO_DATASERVER_LEGACY_HOST) == 0 || !wifi_up ||
                            s_proxy_all_sites) {
                     // Our own names, no Wi-Fi yet, or the web proxy is on (the browser
                     // must come to us for every site): answer with the gateway address
-                    bool own = strcmp(name, PORTAL_DOMAIN) == 0 || strcmp(name, XIINO_DATASERVER_HOST) == 0;
+                    bool own = strcmp(name, PORTAL_DOMAIN) == 0 || strcmp(name, XIINO_DATASERVER_HOST) == 0 ||
+                               strcmp(name, XIINO_DATASERVER_LEGACY_HOST) == 0;
                     log_lookup(name, own ? "portal" : wifi_up ? "web proxy" : "portal (no Wi-Fi)");
                     int n = make_portal_answer(pkt, question_end, inet_addr(PPP_GATEWAY_IP));
                     sendto(sock, pkt, n, 0, (struct sockaddr *)&from, from_len);

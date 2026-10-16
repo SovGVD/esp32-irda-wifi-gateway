@@ -17,6 +17,7 @@ typedef MockHttpClient *esp_http_client_handle_t;
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config);
 esp_err_t esp_http_client_set_method(esp_http_client_handle_t client,esp_http_client_method_t method);
 esp_err_t esp_http_client_set_header(esp_http_client_handle_t client,const char *key,const char *value);
+esp_err_t esp_http_client_set_timeout_ms(esp_http_client_handle_t client,int timeout_ms);
 esp_err_t esp_http_client_set_post_field(esp_http_client_handle_t client,const char *data,int length);
 esp_err_t esp_http_client_perform(esp_http_client_handle_t client);
 esp_err_t esp_http_client_open(esp_http_client_handle_t client,int write_len);
