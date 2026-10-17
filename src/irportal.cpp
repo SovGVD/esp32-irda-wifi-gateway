@@ -83,6 +83,7 @@ static String s_request_agent;     // Browser identification, passed on by the p
 static String s_request_method;    // GET or POST
 static String s_request_body;      // Form fields of a POST, passed on by the proxy
 static XiinoRequest s_xiino_request;
+static uint32_t s_dataserver_pages=0,s_direct_pages=0;
 
 // Google sign-in from a PC: the sign-in pages answer on the Wi-Fi side while
 // this is open (opened from the Palm's Mail page, for GOOGLE_SETUP_WINDOW_MS)
@@ -874,7 +875,11 @@ static void show_esp_status(Page &page,const multi_heap_info_t &heap,uint64_t up
     page.line("Heap free: "+diagnostic_bytes(heap.total_free_bytes));
     page.line("Lowest free heap since boot: "+diagnostic_bytes(heap.minimum_free_bytes));
     page.line("Largest allocatable heap block: "+diagnostic_bytes(heap.largest_free_block));
+    page.line("External requests since boot: Xiino DataServer "+String((unsigned long)s_dataserver_pages)+
+              ", direct proxy "+String((unsigned long)s_direct_pages));
     page.line(String(irxiino_diagnostics().c_str()));
+    std::string interrupted=irxiino_previous_diagnostics();
+    if (!interrupted.empty()) page.line(String(interrupted.c_str()));
     page.line(String(xiino_image_diagnostics().c_str()));
     if (ESP.getPsramSize()) {
         page.line("PSRAM total: "+diagnostic_bytes(ESP.getPsramSize())+"; free: "+diagnostic_bytes(ESP.getFreePsram()));
@@ -2021,6 +2026,9 @@ static void route_request() {
         site = site.substring(0, port);
     }
     site.toLowerCase();
+    if (site.length()>0 && site!=PORTAL_DOMAIN && site!=PPP_GATEWAY_IP) {
+        if (s_xiino_request.dataserver) ++s_dataserver_pages; else ++s_direct_pages;
+    }
     if (s_xiino_request.dataserver && site != PORTAL_DOMAIN && site != PPP_GATEWAY_IP) {
         if (s_request_method != "GET") {
             respond("501 Not Implemented", "text/html", "<HTML><BODY>Unsupported method</BODY></HTML>");
@@ -2633,6 +2641,7 @@ static void dns_task(void *arg) {
 // ------------------------------------------------------------------------------
 
 void irportal_init() {
+    irxiino_init();
     // The connection manager in the portal task decides what to join and when
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);

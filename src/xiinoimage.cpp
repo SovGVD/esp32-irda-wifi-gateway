@@ -1,9 +1,9 @@
 // OpenXiino's colour-only EBDIMAGE/mode 9 path, ported from e9ef506 (MIT).
-// Pillow is replaced by stb_image and a bounded bicubic resize on the ESP32.
+// Bounded thumbnails and integer colour conversion keep work practical on C3.
 #include "xiino.h"
 #include "xiinoalloc.h"
 #include <algorithm>
-#include <cmath>
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <cstddef>
@@ -25,11 +25,29 @@ size_t decoder_peak=0;
 bool decoder_exhausted=false;
 std::string last_image_problem;
 unsigned last_width=0,last_height=0;
+bool last_compact_png=false;
+#ifdef XIINO_TEST_HEAP
+size_t test_heap_free=1024*1024,test_heap_block=1024*1024;
+#endif
 const size_t decoder_budget=192*1024;
+bool image_room(size_t bytes,size_t reserve) {
+#ifdef ESP_PLATFORM
+    size_t available=heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    return available>=reserve && bytes<=available-reserve;
+#elif defined(XIINO_TEST_HEAP)
+    size_t used=decoder_used+reserve;
+    return test_heap_free>=used && bytes<=test_heap_free-used;
+#else
+    (void)bytes; (void)reserve; return true;
+#endif
+}
 void *image_alloc(size_t bytes) {
     if (bytes>decoder_budget || decoder_used>decoder_budget-bytes) { decoder_exhausted=true; return nullptr; }
+    if (!image_room(bytes+sizeof(ImageAllocation),24*1024)) { decoder_exhausted=true; return nullptr; }
 #ifdef ESP_PLATFORM
-    if (heap_caps_get_free_size(MALLOC_CAP_8BIT)<bytes+sizeof(ImageAllocation)+24*1024) { decoder_exhausted=true; return nullptr; }
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)<bytes+sizeof(ImageAllocation)) { decoder_exhausted=true; return nullptr; }
+#elif defined(XIINO_TEST_HEAP)
+    if (test_heap_block<bytes+sizeof(ImageAllocation)) { decoder_exhausted=true; return nullptr; }
 #endif
     auto *block=(ImageAllocation *)std::malloc(sizeof(ImageAllocation)+bytes);
     if (!block) { decoder_exhausted=true; return nullptr; }
@@ -48,6 +66,11 @@ void *image_realloc(void *p,size_t bytes) {
     std::memcpy(next,p,std::min(bytes,block->size)); image_free(p); return next;
 }
 }
+#ifdef XIINO_TEST_HEAP
+void xiino_image_test_heap(size_t available,size_t largest) {
+    test_heap_free=available; test_heap_block=largest;
+}
+#endif
 extern "C" void *xiino_decoder_malloc(size_t size) { return image_alloc(size); }
 extern "C" void *xiino_decoder_calloc(size_t count,size_t size) {
     if (size && count>decoder_budget/size) { decoder_exhausted=true; return nullptr; }
@@ -66,66 +89,93 @@ extern "C" void xiino_decoder_free(void *p) { image_free(p); }
 
 namespace {
 #include "xiino_palette.inc"
-std::string base64(const std::string &bytes) {
+void append_base64(const std::string &bytes,std::string &out) {
     static const char alphabet[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out; out.reserve((bytes.size()+2)/3*4);
     for (size_t i=0;i<bytes.size();i+=3) {
         unsigned a=(uint8_t)bytes[i],b=i+1<bytes.size() ? (uint8_t)bytes[i+1] : 0,c=i+2<bytes.size() ? (uint8_t)bytes[i+2] : 0;
         out+=alphabet[a>>2]; out+=alphabet[((a&3)<<4)|(b>>4)];
         out+=i+1<bytes.size() ? alphabet[((b&15)<<2)|(c>>6)] : '=';
         out+=i+2<bytes.size() ? alphabet[c&63] : '=';
     }
-    return out;
-}
-float cubic(float x) {
-    x=std::fabs(x);
-    if (x<1) return ((1.5f*x-2.5f)*x)*x+1;
-    if (x<2) return ((-0.5f*x+2.5f)*x-4)*x+2;
-    return 0;
 }
 int clamp(int x) { return std::max(0,std::min(255,x)); }
-// Pillow uses a bicubic reduction by default. Resize before white compositing,
-// as EBDConverter does, and quantize using its palette with Floyd-Steinberg.
+}
+
+uint8_t xiino_palette_nearest(uint8_t r,uint8_t g,uint8_t b) {
+    // The first 215 entries form a six-level RGB cube (black is entry 230).
+    // Find its closest point per channel, then compare the 15 extra colours.
+    // Match a full palette scan exactly, including its first-entry tie break.
+    static const auto channel=[]() {
+        std::array<uint8_t,256> result{};
+        static const int levels[]={255,207,154,101,48,0};
+        for (int c=0;c<256;++c) {
+            int distance=256;
+            for (unsigned i=0;i<6;++i) if (std::abs(c-levels[i])<distance) {
+                distance=std::abs(c-levels[i]); result[c]=i;
+            }
+        }
+        return result;
+    }();
+    unsigned ri=channel[r],gi=channel[g],bi=channel[b];
+    unsigned best=(bi/3)*108+ri*18+(bi%3)*6+gi;
+    if (best==215) best=230;
+    auto distance=[&](unsigned i) {
+        int dr=int(r)-xiino_palette[i][0],dg=int(g)-xiino_palette[i][1],db=int(b)-xiino_palette[i][2];
+        return dr*dr+dg*dg+db*db;
+    };
+    int closest=distance(best);
+    for (unsigned i=215;i<230;++i) {
+        int d=distance(i);
+        if (d<closest || (d==closest && i<best)) { best=i; closest=d; }
+    }
+    return (uint8_t)best;
+}
+
+namespace {
+// Area reduction for full-size JPEG/BMP rasters; PNG/GIF/WebP arrive already
+// resized. Composite and diffuse using integers: C3 has no floating-point unit.
 std::vector<uint8_t> palette_image(const uint8_t *pixels,unsigned sw,unsigned sh,
                                   unsigned width,unsigned height,unsigned channels,bool alpha) {
     std::vector<uint8_t> result(width*height);
-    std::vector<float> errors((width+2)*3,0),next(errors.size(),0);
-    float sx=(float)sw/width,sy=(float)sh/height,fx=std::max(1.0f,sx),fy=std::max(1.0f,sy);
+    std::vector<int> errors((width+2)*3,0),next(errors.size(),0);
     for (unsigned y=0;y<height;++y) {
-        float cy=(y+0.5f)*sy;
-        int top=std::max(0,(int)(cy-2*fy+0.5f)),bottom=std::min((int)sh,(int)(cy+2*fy+0.5f));
         for (unsigned x=0;x<width;++x) {
-            float cx=(x+0.5f)*sx;
-            int left=std::max(0,(int)(cx-2*fx+0.5f)),right=std::min((int)sw,(int)(cx+2*fx+0.5f));
-            float sum[3]={0,0,0},weight=0;
-            for (int py=top;py<bottom;++py) {
-                float wy=cubic((py-cy+0.5f)/fy);
-                for (int px=left;px<right;++px) {
-                    float w=wy*cubic((px-cx+0.5f)/fx);
-                    const uint8_t *p=pixels+((size_t)py*sw+px)*channels;
-                    float a=alpha ? p[channels-1]/255.0f : 1;
-                    for (unsigned c=0;c<3;++c) sum[c]+=(p[channels<3 ? 0 : c]*a+255*(1-a))*w;
-                    weight+=w;
+            unsigned rgb[3]={0,0,0};
+            if (sw==width && sh==height) {
+                const uint8_t *p=pixels+((size_t)y*sw+x)*channels;
+                unsigned a=alpha ? p[channels-1] : 255;
+                for (unsigned c=0;c<3;++c) rgb[c]=(p[channels<3 ? 0 : c]*a+255*(255-a)+127)/255;
+            } else {
+                // Coordinates measured in destination pixels give exact integer
+                // coverage weights, including fractional edges of odd sizes.
+                unsigned left=x*sw,right=(x+1)*sw,top=y*sh,bottom=(y+1)*sh;
+                uint64_t sum[3]={0,0,0};
+                for (unsigned py=top/height;py<(bottom+height-1)/height;++py) {
+                    unsigned wy=std::min(bottom,(py+1)*height)-std::max(top,py*height);
+                    for (unsigned px=left/width;px<(right+width-1)/width;++px) {
+                        unsigned wx=std::min(right,(px+1)*width)-std::max(left,px*width);
+                        const uint8_t *p=pixels+((size_t)py*sw+px)*channels;
+                        unsigned a=alpha ? p[channels-1] : 255;
+                        for (unsigned c=0;c<3;++c)
+                            sum[c]+=uint64_t((p[channels<3 ? 0 : c]*a+255*(255-a)+127)/255)*wx*wy;
+                    }
                 }
+                unsigned weight=sw*sh;
+                for (unsigned c=0;c<3;++c) rgb[c]=(sum[c]+weight/2)/weight;
             }
-            int rgb[3];
-            for (unsigned c=0;c<3;++c) rgb[c]=clamp((int)std::round(sum[c]/weight+errors[(x+1)*3+c]));
-            unsigned best=0; int distance=3*256*256;
-            for (unsigned i=0;i<sizeof(xiino_palette)/sizeof(xiino_palette[0]);++i) {
-                int delta=0;
-                for (unsigned c=0;c<3;++c) { int d=rgb[c]-xiino_palette[i][c]; delta+=d*d; }
-                if (delta<distance) { distance=delta; best=i; }
-            }
+            int corrected[3];
+            for (unsigned c=0;c<3;++c) corrected[c]=clamp((int(rgb[c])*16+errors[(x+1)*3+c]+8)/16);
+            unsigned best=xiino_palette_nearest(corrected[0],corrected[1],corrected[2]);
             result[y*width+x]=(uint8_t)best;
             for (unsigned c=0;c<3;++c) {
-                float e=rgb[c]-xiino_palette[best][c];
-                errors[(x+2)*3+c]+=e*7/16;
-                next[x*3+c]+=e*3/16; next[(x+1)*3+c]+=e*5/16; next[(x+2)*3+c]+=e/16;
+                int e=corrected[c]-xiino_palette[best][c];
+                errors[(x+2)*3+c]+=e*7;
+                next[x*3+c]+=e*3; next[(x+1)*3+c]+=e*5; next[(x+2)*3+c]+=e;
             }
         }
         errors.swap(next); std::fill(next.begin(),next.end(),0);
 #ifdef ESP_PLATFORM
-        vTaskDelay(1);
+        if (!(y&15)) vTaskDelay(1);
 #endif
     }
     return result;
@@ -133,7 +183,7 @@ std::vector<uint8_t> palette_image(const uint8_t *pixels,unsigned sw,unsigned sh
 struct PngRaster {
     uint8_t *pixels;
     unsigned sw,sh,w,h;
-    bool complete;
+    bool complete,indexed;
 };
 void png_draw(pngle_t *png,uint32_t x,uint32_t y,uint32_t rw,uint32_t rh,const uint8_t rgba[4]) {
 #ifdef ESP_PLATFORM
@@ -145,19 +195,20 @@ void png_draw(pngle_t *png,uint32_t x,uint32_t y,uint32_t rw,uint32_t rh,const u
     unsigned top=((uint64_t)2*y*r.h+r.sh-1)/(2*r.sh);
     unsigned bottom=std::min(r.h,(unsigned)(((uint64_t)2*(y+rh)*r.h+r.sh-1)/(2*r.sh)));
     for (unsigned py=top;py<bottom;++py) for (unsigned px=left;px<right;++px) {
-        uint8_t *p=r.pixels+((size_t)py*r.w+px)*3;
-        for (unsigned c=0;c<3;++c) p[c]=(rgba[c]*rgba[3]+255*(255-rgba[3])+127)/255;
+        unsigned rgb[3];
+        for (unsigned c=0;c<3;++c) rgb[c]=(rgba[c]*rgba[3]+255*(255-rgba[3])+127)/255;
+        size_t at=(size_t)py*r.w+px;
+        if (r.indexed) r.pixels[at]=xiino_palette_nearest(rgb[0],rgb[1],rgb[2]);
+        else for (unsigned c=0;c<3;++c) r.pixels[at*3+c]=rgb[c];
     }
 }
-bool decode_png(const std::string &file,PngRaster &r,std::string &problem) {
-    std::unique_ptr<pngle_t,decltype(&pngle_destroy)> png(pngle_new(),pngle_destroy);
-    if (!png) { problem="PNG decoder memory limit"; return false; }
-    pngle_set_user_data(png.get(),&r);
-    pngle_set_draw_callback(png.get(),png_draw);
-    pngle_set_done_callback(png.get(),[](pngle_t *p) { ((PngRaster *)pngle_get_user_data(p))->complete=true; });
+bool decode_png(const std::string &file,PngRaster &r,pngle_t *png,std::string &problem) {
+    pngle_set_user_data(png,&r);
+    pngle_set_draw_callback(png,png_draw);
+    pngle_set_done_callback(png,[](pngle_t *p) { ((PngRaster *)pngle_get_user_data(p))->complete=true; });
     size_t at=0;
     while (at<file.size()) {
-        int n=pngle_feed(png.get(),file.data()+at,file.size()-at);
+        int n=pngle_feed(png,file.data()+at,file.size()-at);
         if (n<=0) { problem=decoder_exhausted ? "PNG decoder memory limit" : "Invalid or incomplete PNG"; return false; }
         at+=(size_t)n;
 #ifdef ESP_PLATFORM
@@ -275,7 +326,7 @@ bool decode_gif(const std::string &file,PngRaster &r,std::string &problem) {
 
 std::string xiino_mode9(const std::vector<uint8_t> &pixels,unsigned width,unsigned height) {
     if (!width || width>153 || !height || pixels.size()!=(size_t)width*height) return "";
-    std::string out;
+    std::string out; out.reserve(pixels.size());
     static const uint8_t run_codes[]={0,0xec,0xf0,0xf4,0xf8,0xfc,0xe8};
     static const uint8_t copy_codes[][3]={{0,0,0},{0xed,0xee,0xef},{0xf1,0xf2,0xf3},
         {0xf5,0xf6,0xf7},{0xf9,0xfa,0xfb},{0xfd,0xfe,0xff},{0xe9,0xea,0xeb}};
@@ -318,7 +369,7 @@ bool xiino_image(const std::string &file,unsigned slot,const XiinoLimits &limits
                  std::string &img,std::string &ebd,std::string &problem) {
     img.clear(); ebd.clear(); problem.clear();
     decoder_peak=0; decoder_exhausted=false;
-    last_image_problem.clear(); last_width=last_height=0;
+    last_image_problem.clear(); last_width=last_height=0; last_compact_png=false;
     auto fail=[&](const char *why) { problem=why; last_image_problem=why; return false; };
     if (file.empty() || file.size()>limits.image_bytes) return fail("Image exceeds the configured byte limit");
     int width=0,height=0,channels=0;
@@ -339,17 +390,23 @@ bool xiino_image(const std::string &file,unsigned slot,const XiinoLimits &limits
     unsigned w=width>306 ? 153 : (width+1)/2;
     unsigned h=width>306 ? (unsigned)(((size_t)height*153+width-1)/width) : (height+1)/2;
     if ((size_t)w*h>limits.image_pixels) return fail("Resized image exceeds the configured pixel limit");
+    if (limits.checkpoint) limits.checkpoint("Decoding Xiino image");
     std::unique_ptr<uint8_t,decltype(&image_free)> pixels(nullptr,image_free);
     unsigned sw=width,sh=height;
     bool alpha=channels==2 || channels==4;
     if (png || gif || webp) {
-        channels=webp ? 4 : 3;
+        // Prefer the dithered RGB thumbnail; use direct palette sampling if
+        // that raster plus PNG workspace would breach the free-heap reserve.
+        last_compact_png=png && !image_room((size_t)w*h*3+PNGLE_T_SIZE+32768+(size_t)width*8+1024,24*1024);
+        std::unique_ptr<pngle_t,decltype(&pngle_destroy)> decoder(png ? pngle_new() : nullptr,pngle_destroy);
+        if (png && !decoder) return fail("PNG decoder memory limit");
+        channels=last_compact_png ? 1 : webp ? 4 : 3;
         pixels.reset((uint8_t *)image_alloc((size_t)w*h*channels));
         if (!pixels) return fail("Thumbnail memory limit");
         if (png || gif) {
-            std::memset(pixels.get(),255,(size_t)w*h*channels);
-            PngRaster raster={pixels.get(),(unsigned)width,(unsigned)height,w,h,false};
-            if (!(png ? decode_png(file,raster,problem) : decode_gif(file,raster,problem))) { last_image_problem=problem; return false; }
+            std::memset(pixels.get(),last_compact_png ? 0 : 255,(size_t)w*h*channels);
+            PngRaster raster={pixels.get(),(unsigned)width,(unsigned)height,w,h,false,last_compact_png};
+            if (!(png ? decode_png(file,raster,decoder.get(),problem) : decode_gif(file,raster,problem))) { last_image_problem=problem; return false; }
             alpha=false;
         } else {
             WebPDecoderConfig config;
@@ -371,16 +428,26 @@ bool xiino_image(const std::string &file,unsigned slot,const XiinoLimits &limits
         pixels.reset(stbi_load_from_memory(input,(int)file.size(),&width,&height,&channels,0));
         if (!pixels) return fail(decoder_exhausted ? "Image decoder memory limit" : "Invalid or incomplete image");
     }
-    auto indexed=palette_image(pixels.get(),sw,sh,w,h,channels,alpha && !gif);
+    if (limits.checkpoint) limits.checkpoint("Quantizing Xiino image");
+    if (!image_room((size_t)w*h+(w+2)*3*2*sizeof(int),24*1024)) return fail("Image conversion memory limit");
+    auto indexed=last_compact_png ? std::vector<uint8_t>(pixels.get(),pixels.get()+(size_t)w*h) :
+        palette_image(pixels.get(),sw,sh,w,h,channels,alpha && !gif);
     pixels.reset();
-    std::string encoded=base64(xiino_mode9(indexed,w,h));
+    if (limits.checkpoint) limits.checkpoint("Encoding Xiino image");
+    // Bound the remaining C++ storage as well as the C decoder allocations.
+    // Do not retain separate packed, base64 and copied EBD payloads together.
+    if (!image_room(indexed.size()*3+512,24*1024)) return fail("Image encoding memory limit");
+    std::string packed=xiino_mode9(indexed,w,h);
+    std::vector<uint8_t>().swap(indexed);
     std::string id=std::to_string(slot),ws=std::to_string(w),hs=std::to_string(h);
     img="<IMG ALT=\"None\" WIDTH=\""+ws+"\" HEIGHT=\""+hs+"\" EBDWIDTH=\""+ws+"\" EBDHEIGHT=\""+hs+"\" EBD=\"#"+id+"\">";
-    ebd="<EBDIMAGE MODE=\"9\" NAME=\""+id+"\"><!--"+encoded+"--></EBDIMAGE>";
+    const std::string prefix="<EBDIMAGE MODE=\"9\" NAME=\""+id+"\"><!--";
+    ebd.reserve(prefix.size()+(packed.size()+2)/3*4+14);
+    ebd=prefix; append_base64(packed,ebd); ebd+="--></EBDIMAGE>";
     return true;
 }
 
 std::string xiino_image_diagnostics() {
     return "Image: "+std::to_string(last_width)+"x"+std::to_string(last_height)+", decoder peak "+
-        std::to_string(decoder_peak)+" bytes, live "+std::to_string(decoder_used)+(last_image_problem.empty() ? "" : "; "+last_image_problem);
+        std::to_string(decoder_peak)+" bytes, live "+std::to_string(decoder_used)+(last_compact_png ? ", compact PNG" : "")+(last_image_problem.empty() ? "" : "; "+last_image_problem);
 }

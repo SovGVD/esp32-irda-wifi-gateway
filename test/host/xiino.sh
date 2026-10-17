@@ -4,7 +4,7 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$here/../.." && pwd)
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
-flags="-std=c++17 -Wall -Wextra -Wno-unused-function -O1 -g -fsanitize=address,undefined"
+flags="-DXIINO_TEST_HEAP -std=c++17 -Wall -Wextra -Wno-unused-function -O1 -g -fsanitize=address,undefined"
 for source in "$root"/third_party/libwebp/src/dec/*.c "$root"/third_party/libwebp/src/dsp/*.c "$root"/third_party/libwebp/src/utils/*.c; do
     object=$(basename "$(dirname "$source")")_$(basename "$source" .c)
     cc -std=c99 -O1 -g -fsanitize=address,undefined -DHAVE_CONFIG_H \

@@ -98,7 +98,8 @@ std::string escape(const std::string &s) {
     }
     return out;
 }
-const std::string &page_text(const XiinoResource &page, std::string &converted) {
+enum class PageEncoding { Utf8, Latin1, Windows1252 };
+PageEncoding page_encoding(const XiinoResource &page) {
     std::string type=lower(page.content_type),encoding;
     size_t at=type.find("charset=");
     if (at!=type.npos) {
@@ -106,12 +107,22 @@ const std::string &page_text(const XiinoResource &page, std::string &converted) 
         if (!encoding.empty() && (encoding[0]=='\'' || encoding[0]=='"')) encoding.erase(0,1);
         encoding=encoding.substr(0,encoding.find_first_of(";\"' \t\r\n"));
     } else if (type.compare(0,5,"text/")==0) encoding="iso-8859-1"; // requests' HTTP default
-    bool latin=encoding=="iso-8859-1" || encoding=="latin-1" || encoding=="latin1" || encoding=="iso8859-1";
-    bool windows=encoding=="windows-1252" || encoding=="cp1252";
-    if (!latin && !windows) return page.body;
+    if (encoding=="windows-1252" || encoding=="cp1252") return PageEncoding::Windows1252;
+    if (encoding=="iso-8859-1" || encoding=="latin-1" || encoding=="latin1" || encoding=="iso8859-1") return PageEncoding::Latin1;
+    return PageEncoding::Utf8;
+}
+std::string source_text(const std::string &text,PageEncoding encoding) {
+    if (encoding==PageEncoding::Utf8) return text;
     static const unsigned codes[]={8364,129,8218,402,8222,8230,8224,8225,710,8240,352,8249,338,141,381,143,144,8216,8217,8220,8221,8226,8211,8212,732,8482,353,8250,339,157,382,376};
-    for (unsigned char c : page.body) utf8(converted,windows && c>=128 && c<=159 ? codes[c-128] : c);
-    return converted;
+    std::string out;
+    for (unsigned char c : text) utf8(out,encoding==PageEncoding::Windows1252 && c>=128 && c<=159 ? codes[c-128] : c);
+    return out;
+}
+// Search raw-text closing tags without allocating a lowercase page copy.
+size_t find_case_insensitive(const std::string &text,const std::string &needle,size_t start) {
+    auto found=std::search(text.begin()+start,text.end(),needle.begin(),needle.end(),
+        [](unsigned char a,unsigned char b) { return std::tolower(a)==std::tolower(b); });
+    return found==text.end() ? text.npos : size_t(found-text.begin());
 }
 std::string setting(const std::string &s, const char *prefix) {
     size_t at=s.find(std::string("/")+prefix);
@@ -182,7 +193,8 @@ std::string xiino_resolve(const std::string &base, const std::string &reference)
 static bool convert_page(const XiinoResource &page, const XiinoFetch &fetch,
                    const XiinoLimits &limits, std::string &html, std::string &problem,const XiinoSink *sink) {
     html.clear(); problem.clear();
-    std::string embedded;
+    std::vector<std::string> embedded;
+    size_t embedded_bytes=0;
     const std::string shortened_notice="\n<P>[Page shortened to fit the Palm]</P>\n</BODY></HTML>\n";
     if (limits.page_bytes<=shortened_notice.size()) {
         problem="Xiino page limit is too small"; return false;
@@ -207,7 +219,7 @@ static bool convert_page(const XiinoResource &page, const XiinoFetch &fetch,
     auto append=[&](const std::string &text,bool atomic=true) {
         std::string bytes=latin1(text);
         if (stopped) return true;
-        size_t remaining=payload_limit-emitted-html.size()-embedded.size();
+        size_t remaining=payload_limit-emitted-html.size()-embedded_bytes;
         if (bytes.size()>remaining) {
             if (!atomic) html.append(bytes,0,remaining);
             shortened=true; stopped=true; return flush();
@@ -215,15 +227,20 @@ static bool convert_page(const XiinoResource &page, const XiinoFetch &fetch,
         html+=bytes;
         return html.size()<512 || flush();
     };
+    const PageEncoding encoding=page_encoding(page);
     auto data=[&](const std::string &text, bool refs) {
-        return !parsing_supported || text.empty() || append(trim(refs ? unescape(text) : text)+"\n",false);
+        if (!parsing_supported || text.empty()) return true;
+        std::string decoded=source_text(text,encoding);
+        return append(trim(refs ? unescape(decoded) : decoded)+"\n",false);
     };
-    std::string converted;
-    const std::string &source=page_text(page,converted);
+    // HTML structure is ASCII in all supported encodings. Convert text and
+    // attribute values only when consumed, never retain another full page
+    // beside the compacted source, TLS state and decoded image workspace.
+    const std::string &source=page.body;
     std::string rawtag;
     for (size_t at=0;at<source.size() && !stopped;) {
         if (!rawtag.empty()) {
-            size_t end=lower(source).find("</"+rawtag,at);
+            size_t end=find_case_insensitive(source,"</"+rawtag,at);
             if (end==source.npos) break; // HTMLParser buffers unfinished script/style content.
             if (!data(source.substr(at,end-at),false)) return false;
             at=end; rawtag.clear();
@@ -270,7 +287,7 @@ static bool convert_page(const XiinoResource &page, const XiinoFetch &fetch,
                 char quote=pos<source.size() && (source[pos]=='\'' || source[pos]=='"') ? source[pos++] : 0;
                 start=pos;
                 while (pos<source.size() && (quote ? source[pos]!=quote : (!space(source[pos]) && source[pos]!='>'))) ++pos;
-                value=unescape(source.substr(start,pos-start));
+                value=unescape(source_text(source.substr(start,pos-start),encoding));
                 if (quote && pos<source.size()) ++pos;
             }
             attrs.emplace_back(name,value);
@@ -289,16 +306,19 @@ static bool convert_page(const XiinoResource &page, const XiinoFetch &fetch,
                 if (!flush()) return false; // Text reaches the Palm before optional network/image work.
                 XiinoResource image; std::string img,ebd,error;
                 if (!fetch(xiino_resolve(page.url,src),limits.image_bytes,image,error)) {
-                    if (!append("<p>[Image unavailable]</p>")) return false;
+                    std::string why=error.find("memory")!=error.npos ? "memory limit" :
+                        error.find("budget")!=error.npos ? "page image budget" :
+                        error.find("time limit")!=error.npos ? "download timeout" : "download failed";
+                    if (!append("<p>[Image unavailable: "+why+"]</p>")) return false;
                     continue;
                 }
                 if (xiino_image(image.body,slot+1,limits,img,ebd,error)) {
                     size_t total=img.size()+ebd.size()+2;
-                    if (total>payload_limit-emitted-html.size()-embedded.size()) {
+                    if (total>payload_limit-emitted-html.size()-embedded_bytes) {
                         if (!append("<p>[Image omitted: page limit]</p>")) return false;
                         continue;
                     }
-                    embedded+=ebd+"\n"; ++slot;
+                    embedded_bytes+=ebd.size()+1; embedded.push_back(std::move(ebd)); ++slot;
                     if (!append(img+"\n")) return false;
                 } else {
                     std::string why=error.find("memory")!=error.npos || error.find("Thumbnail")!=error.npos ?
@@ -325,8 +345,9 @@ static bool convert_page(const XiinoResource &page, const XiinoFetch &fetch,
     }
     if (shortened) html+=shortened_notice;
     if (sink) {
-        if (!flush() || !write(embedded)) return false;
-    } else html+=embedded;
+        if (!flush()) return false;
+        for (const auto &image : embedded) if (!write(image) || !write("\n")) return false;
+    } else for (const auto &image : embedded) { html+=image; html+='\n'; }
     return true;
 }
 

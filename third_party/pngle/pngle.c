@@ -126,7 +126,7 @@ struct _pngle_t {
 	uint8_t *next_out; // NULL indicates IDAT hasn't been processed yet
 	size_t  avail_out;
 	tinfl_decompressor inflator; // 11000 bytes
-	uint8_t lz_buf[TINFL_LZ_DICT_SIZE]; // 32768 bytes
+	uint8_t *lz_buf; // Separate 32 KiB block; avoid a >44 KiB contiguous allocation
 };
 
 const size_t PNGLE_T_SIZE = sizeof(pngle_t);
@@ -201,8 +201,13 @@ void pngle_reset(pngle_t *pngle)
 
 pngle_t *pngle_new()
 {
+	// Largest allocation first: C3 often has enough free heap spread across
+	// blocks smaller than the old combined 44 KiB object.
+	uint8_t *dictionary = (uint8_t *)PNGLE_CALLOC(1, TINFL_LZ_DICT_SIZE, "dictionary");
+	if (!dictionary) return NULL;
 	pngle_t *pngle = (pngle_t *)PNGLE_CALLOC(1, sizeof(pngle_t), "pngle_t");
-	if (!pngle) return NULL;
+	if (!pngle) { xiino_decoder_free(dictionary); return NULL; }
+	pngle->lz_buf = dictionary;
 
 	pngle_reset(pngle);
 
@@ -213,6 +218,7 @@ void pngle_destroy(pngle_t *pngle)
 {
 	if (pngle) {
 		pngle_reset(pngle);
+		xiino_decoder_free(pngle->lz_buf);
 		xiino_decoder_free(pngle);
 	}
 }

@@ -48,6 +48,7 @@ struct XiinoLimits {
     size_t page_bytes = 48000;
     size_t image_bytes = 64000;
     size_t image_pixels = 153 * 1024;
+    std::function<void(const char *)> checkpoint;
 };
 
 // Produces HTML only; the HTTP adapter adds the binary DataServer padding.
@@ -57,8 +58,14 @@ bool xiino_convert_stream(const XiinoResource &page,const XiinoFetch &fetch,
                           const XiinoLimits &limits,const XiinoSink &sink,std::string &problem);
 std::string xiino_builtin(const XiinoRequest &request, const std::string &headers);
 
+// Exact nearest OpenXiino palette colour, with the original tie ordering.
+uint8_t xiino_palette_nearest(uint8_t r, uint8_t g, uint8_t b);
+
 // Mode 9 uses palette indices, row lookbacks and run-length control codes.
 std::string xiino_mode9(const std::vector<uint8_t> &pixels, unsigned width, unsigned height);
 bool xiino_image(const std::string &file, unsigned slot, const XiinoLimits &limits,
                  std::string &img, std::string &ebd, std::string &problem);
 std::string xiino_image_diagnostics();
+#ifdef XIINO_TEST_HEAP
+void xiino_image_test_heap(size_t available, size_t largest);
+#endif

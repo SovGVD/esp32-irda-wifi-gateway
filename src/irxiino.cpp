@@ -8,6 +8,13 @@
 #include <list>
 #include <cstring>
 #include <strings.h>
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
 #ifdef IRXIINO_TEST_CLOCK
 extern uint32_t irxiino_test_clock();
 #elif !defined(ESP_PLATFORM)
@@ -25,11 +32,27 @@ uint32_t now_ms() {
 #endif
 }
 struct XiinoRun {
-    uint32_t started=0,finished=0,images_started=0;
+    uint32_t started=0,finished=0;
+    uint32_t page_ms=0,image_ms=0,send_ms=0,first_byte_ms=0;
+    bool running=false,has_output=false;
     size_t raw_bytes=0,output_bytes=0,images=0;
-    std::string stage,last_image;
+    std::string stage,last_image,first_image;
 };
 XiinoRun last_run;
+#ifdef ESP_PLATFORM
+RTC_NOINIT_ATTR SyncDiagnosticState retained_run;
+SyncDiagnosticState previous_run;
+#endif
+bool diagnostics_initialized=false;
+void checkpoint(const char *stage) {
+#ifdef ESP_PLATFORM
+    multi_heap_info_t heap={}; heap_caps_get_info(&heap,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    syncdiag_event(retained_run,stage,heap.total_free_bytes,heap.largest_free_block,
+        uxTaskGetStackHighWaterMark(nullptr),now_ms());
+#else
+    (void)stage;
+#endif
+}
 struct Headers {
     std::string location,type,encoding;
     static esp_err_t event(esp_http_client_event_t *event) {
@@ -45,6 +68,16 @@ bool fetch_resource(const std::string &first,size_t limit,XiinoResource &resourc
     std::string url=first;
     const uint32_t started=now_ms();
     resource=XiinoResource();
+    if (compact_page) {
+        // Allocate once before TLS consumes heap. Growing std::string with a
+        // live TLS connection briefly needs both the old and new buffers;
+        // the per-read 1 KiB admission check cannot protect that larger jump.
+        if (!irsyncdiag_memory_available(limit+1,50*1024)) {
+            problem="Not enough memory for Xiino page buffer"; return false;
+        }
+        checkpoint("Reserving Xiino page buffer");
+        resource.body.reserve(limit);
+    }
     for (unsigned hop=0;hop<=PROXY_MAX_REDIRECTS;++hop) {
         if (now_ms()-started>=timeout) { problem="Xiino resource time limit"; return false; }
         if (url.compare(0,7,"http://") && url.compare(0,8,"https://")) {
@@ -71,6 +104,7 @@ bool fetch_resource(const std::string &first,size_t limit,XiinoResource &resourc
         esp_http_client_set_header(client,"User-Agent","OpenXiino/1.0 (http://github.com/nicl83/openxiino) python-requests/2.27.1");
         esp_http_client_set_header(client,"Accept","*/*");
         esp_http_client_set_header(client,"Accept-Encoding","identity");
+        checkpoint(compact_page ? "Opening page connection" : "Opening image connection");
         esp_err_t err=esp_http_client_open(client,0);
         if (err==ESP_OK) esp_http_client_set_timeout_ms(client,std::max(uint32_t(1),timeout-std::min(timeout,uint32_t(now_ms()-started))));
         if (err==ESP_OK && esp_http_client_fetch_headers(client)<0) err=ESP_ERR_HTTP_FETCH_HEADER;
@@ -87,6 +121,7 @@ bool fetch_resource(const std::string &first,size_t limit,XiinoResource &resourc
             problem="Origin ignored Xiino's uncompressed transfer request";
             esp_http_client_cleanup(client); return false;
         }
+        checkpoint(compact_page ? "Receiving/filtering page" : "Receiving image");
         while (err==ESP_OK) {
             uint32_t elapsed=now_ms()-started;
             if (elapsed>=timeout) { problem="Xiino resource time limit"; break; }
@@ -109,10 +144,19 @@ bool fetch_resource(const std::string &first,size_t limit,XiinoResource &resourc
         // Do not retain a live TLS connection while decoding images or fetching
         // their sibling resources. Chunk framing is consumed by ESP-IDF.
         esp_http_client_cleanup(client);
-        if (err!=ESP_OK) { problem="Xiino HTTP/HTTPS transfer failed"; return false; }
+        if (err!=ESP_OK) {
+            problem=now_ms()-started>=timeout ? "Xiino resource time limit" : "Xiino HTTP/HTTPS transfer failed ("+std::to_string(err)+")";
+            return false;
+        }
         if (!problem.empty()) return false;
         if (compact_page) {
             filter.finish();
+            // TLS is closed now. Return unused source capacity to the heap
+            // before starting sibling image connections/decoders.
+            if (resource.body.capacity()>resource.body.size()+4096 &&
+                irsyncdiag_memory_available(resource.body.size()+1,24*1024)) {
+                std::string compact(resource.body); resource.body.swap(compact);
+            }
         } else {
             if (!irsyncdiag_memory_available(received+1,8*1024)) {
                 problem="Not enough memory to assemble Xiino image"; return false;
@@ -128,10 +172,10 @@ bool fetch_resource(const std::string &first,size_t limit,XiinoResource &resourc
     problem="Too many Xiino redirects"; return false;
 }
 bool fetch(const std::string &url,size_t limit,XiinoResource &resource,std::string &problem) {
-    if (!last_run.images) last_run.images_started=now_ms();
-    uint32_t elapsed=now_ms()-last_run.images_started;
+    uint32_t elapsed=last_run.image_ms; // IR delivery/CPU time is not image download time.
     if (elapsed>=XIINO_IMAGES_TIMEOUT_MS || last_run.images>=XIINO_MAX_IMAGES) {
-        problem="Optional image time/count budget"; last_run.last_image=problem; return false;
+        problem=elapsed>=XIINO_IMAGES_TIMEOUT_MS ? "Optional image download time budget" : "Optional image count budget";
+        last_run.last_image=problem; return false;
     }
     ++last_run.images;
     if (url.compare(0,5,"data:")==0) {
@@ -163,12 +207,38 @@ bool fetch(const std::string &url,size_t limit,XiinoResource &resource,std::stri
         return true;
     }
     last_run.stage="Fetching image";
+    uint32_t started=now_ms();
     bool ok=fetch_resource(url,limit,resource,problem,false,
         std::min((uint32_t)XIINO_IMAGE_TIMEOUT_MS,(uint32_t)XIINO_IMAGES_TIMEOUT_MS-elapsed));
-    if (!ok) last_run.last_image=problem;
+    last_run.image_ms+=now_ms()-started;
+    if (!ok) {
+        last_run.last_image=problem;
+        if (last_run.first_image.empty()) last_run.first_image=problem;
+    }
     last_run.stage="Converting page";
     return ok;
 }
+}
+
+void irxiino_init() {
+    if (diagnostics_initialized) return;
+    diagnostics_initialized=true;
+#ifdef ESP_PLATFORM
+    auto reason=esp_reset_reason();
+    if (reason!=ESP_RST_POWERON && reason!=ESP_RST_BROWNOUT && syncdiag_valid(retained_run)) previous_run=retained_run;
+    syncdiag_begin(retained_run); syncdiag_finish(retained_run,"No Xiino request since boot",false);
+#endif
+}
+std::string irxiino_previous_diagnostics() {
+    irxiino_init();
+#ifdef ESP_PLATFORM
+    if (syncdiag_valid(previous_run) && previous_run.active && previous_run.count) {
+        const auto &last=previous_run.events[(previous_run.next+7)%8];
+        return "Xiino interrupted before reset: "+std::string(last.stage)+"; heap "+std::to_string(last.free_heap)+
+            ", largest "+std::to_string(last.largest_block)+", stack free "+std::to_string(last.stack_free)+" bytes";
+    }
+#endif
+    return "";
 }
 
 bool irxiino_page(const XiinoRequest &request,const std::string &headers,
@@ -180,33 +250,79 @@ bool irxiino_page(const XiinoRequest &request,const std::string &headers,
 bool irxiino_stream(const XiinoRequest &request,const std::string &headers,
                     const std::function<bool()> &begin,const XiinoSink &sink,std::string &problem) {
     problem.clear();
-    last_run=XiinoRun(); last_run.started=now_ms(); last_run.stage="Fetching page";
+    irxiino_init();
+#ifdef ESP_PLATFORM
+    syncdiag_begin(retained_run); syncdiag_service(retained_run,"Xiino");
+#endif
+    checkpoint("Starting Xiino request");
+    auto finish=[&](bool ok) {
+#ifdef ESP_PLATFORM
+        syncdiag_finish(retained_run,ok ? "Complete" : "Request failed",!ok);
+#else
+        (void)ok;
+#endif
+    };
+    last_run=XiinoRun(); last_run.started=now_ms(); last_run.running=true; last_run.stage="Fetching page";
+    auto deliver=[&](const char *bytes,size_t size) {
+        last_run.stage="Sending page";
+        checkpoint("Sending Xiino response");
+        uint32_t started=now_ms();
+        bool ok=sink(bytes,size);
+        last_run.send_ms+=now_ms()-started;
+        if (ok && size) {
+            if (!last_run.has_output) last_run.first_byte_ms=now_ms()-last_run.started;
+            last_run.has_output=true; last_run.output_bytes+=size;
+        }
+        last_run.stage="Converting page";
+        return ok;
+    };
+    auto start_response=[&]() {
+        uint32_t started=now_ms();
+        bool ok=begin();
+        last_run.send_ms+=now_ms()-started;
+        if (!ok) problem="Palm disconnected before Xiino response";
+        return ok;
+    };
     const std::string builtin=xiino_builtin(request,headers);
     if (!builtin.empty()) {
-        bool ok=begin() && sink(builtin.data(),builtin.size());
-        last_run.output_bytes=ok ? builtin.size() : 0; last_run.finished=now_ms();
+        bool ok=start_response() && deliver(builtin.data(),builtin.size());
+        last_run.finished=now_ms(); last_run.running=false;
         last_run.stage=ok ? "Complete" : "Palm disconnected";
-        return ok;
+        finish(ok); return ok;
     }
     irdbg_printf("Xiino: fetching %s",request.url.c_str());
     XiinoLimits limits;
     limits.page_bytes=PROXY_MAX_PAGE_BYTES;
     limits.image_bytes=XIINO_MAX_IMAGE_BYTES;
     limits.image_pixels=XIINO_MAX_IMAGE_PIXELS;
+    limits.checkpoint=checkpoint;
     XiinoResource page;
     bool ok=fetch_resource(request.url,limits.page_bytes,page,problem,true,XIINO_PAGE_TIMEOUT_MS);
-    if (ok && (ok=begin())) {
+    last_run.page_ms=now_ms()-last_run.started;
+    if (ok && (ok=start_response())) {
         last_run.stage="Converting page";
-        ok=xiino_convert_stream(page,fetch,limits,[&](const char *bytes,size_t size) {
-            if (!sink(bytes,size)) return false;
-            last_run.output_bytes+=size; return true;
-        },problem);
+        checkpoint("Converting Xiino HTML");
+        ok=xiino_convert_stream(page,fetch,limits,deliver,problem);
     }
-    last_run.finished=now_ms(); last_run.stage=ok ? "Complete" : problem;
+    last_run.finished=now_ms(); last_run.running=false; last_run.stage=ok ? "Complete" : problem;
+    finish(ok);
+    irdbg_printf("Xiino: %s, %lu ms, source %u, sent %u, images %u",last_run.stage.c_str(),
+        (unsigned long)(last_run.finished-last_run.started),(unsigned)last_run.raw_bytes,
+        (unsigned)last_run.output_bytes,(unsigned)last_run.images);
+    irdbg_printf("Xiino ms: origin %lu, images %lu, socket %lu, first body %lu",
+        (unsigned long)last_run.page_ms,(unsigned long)last_run.image_ms,
+        (unsigned long)last_run.send_ms,(unsigned long)last_run.first_byte_ms);
     return ok;
 }
 std::string irxiino_diagnostics() {
-    return "Xiino: "+last_run.stage+"; "+std::to_string(last_run.finished-last_run.started)+" ms, source "+
+    if (last_run.stage.empty()) return "Xiino: idle";
+    uint32_t duration=(last_run.running ? now_ms() : last_run.finished)-last_run.started;
+    uint32_t processing=duration-last_run.page_ms-last_run.image_ms-last_run.send_ms;
+    return "Xiino: "+last_run.stage+"; "+std::to_string(duration)+" ms, source "+
         std::to_string(last_run.raw_bytes)+", sent "+std::to_string(last_run.output_bytes)+", images "+std::to_string(last_run.images)+
-        (last_run.last_image.empty() ? "" : "; "+last_run.last_image);
+        "; origin "+std::to_string(last_run.page_ms)+" ms, images "+std::to_string(last_run.image_ms)+
+        " ms, processing "+std::to_string(processing)+" ms, socket "+std::to_string(last_run.send_ms)+
+        " ms, first body "+(last_run.has_output ? std::to_string(last_run.first_byte_ms)+" ms" : "pending")+
+        (last_run.first_image.empty() ? "" : "; first image error: "+last_run.first_image)+
+        (last_run.last_image.empty() || last_run.last_image==last_run.first_image ? "" : "; "+last_run.last_image);
 }

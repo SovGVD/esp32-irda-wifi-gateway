@@ -23,7 +23,9 @@ formats using native channels rather than always expanding to RGBA.
 `b1c68193f1d3f8642b3e0e095d457a828038e6fb` (MIT; included). PNG scanlines are
 sampled directly into the target thumbnail, with alpha composited onto white.
 Local changes route allocation through the bounded allocator, use ESP32-C3 ROM
-miniz in firmware, and cast the high byte before a 32-bit shift. Portable host
+miniz in firmware, and cast the high byte before a 32-bit shift. The 32 KiB
+dictionary is allocated separately before the decoder state, avoiding a single
+44 KiB object which cannot fit a fragmented heap. Portable host
 tests use the bundled public-domain miniz with unaligned integer accesses
 disabled; its feature-macro guard was adjusted to permit this override.
 
@@ -44,8 +46,12 @@ handled. GIF is a service mark of CompuServe Incorporated.
 Static PNG/JPEG/GIF/WebP/BMP images are supported; animated GIFs use the first
 frame, while animated WebP, TIFF and SVG are unsupported. Small inline data URIs
 are decoded without an HTTP request, within tag/source/image limits. PNG/GIF
-thumbnail sampling, WebP decoder scaling and fallback bicubic reduction can
-differ from Pillow. Palette conversion uses white compositing/error diffusion;
+thumbnail sampling, WebP decoder scaling and integer area reduction for JPEG/BMP
+can differ from Pillow. Already-sized thumbnails skip further resampling.
+Palette conversion uses integer white compositing/Floyd-Steinberg diffusion and
+an exact nearest-colour lookup using the RGB cube plus extra palette entries.
+When PNG workspace plus the RGB thumbnail would breach the free-heap reserve,
+a direct palette thumbnail uses one byte per target pixel and omits dithering;
 the upstream mode 9 compression quirks remain.
 
 ESP32-specific bounds: page input is scanned in 512-byte blocks up to a 2 MiB
@@ -53,8 +59,13 @@ raw-input budget. A bounded streaming filter discards script/style contents,
 comments and unused modern attributes, collapses ordinary whitespace and keeps
 preformatted whitespace. It retains no more than 48,000 compacted-source bytes;
 individual tag buffering is capped at 4 KiB (larger tags retain only their name).
+The converter parses the retained byte buffer directly, decodes text/attributes
+as consumed, and searches raw-text closing tags without a full lowercase copy.
+This avoids retaining another page-sized UTF-8 encoding buffer for no-charset,
+Latin-1 and Windows-1252 HTML while downloading/decoding its images.
 The converter sends HTML in blocks of at most 512 bytes, flushing before each
-image request, and appends complete EBD payloads after the HTML. It uses the
+image request, and appends complete EBD payloads after the HTML. Each EBD is
+retained separately rather than repeatedly copying the accumulated image data. It uses the
 same HTTP/1.0 close-delimited framing as OpenXiino, without waiting to assemble
 the complete converted HTML page. Output remains capped at 48,000 bytes.
 Pages exceeding retained-source, scan or output budgets keep their readable
@@ -72,9 +83,9 @@ HTTPS uses the existing ESP-IDF CA bundle. Origins are asked for uncompressed
 responses; a server ignoring that request is rejected.
 
 Page downloads have a 20-second deadline across redirects/reads. Each image
-download has a 3-second deadline; attempts share an 8-second elapsed budget and
-an eight-image count cap. Deadlines are updated before each blocking read.
-Conversion/delivery time between attempts counts towards the elapsed image gate.
+download has a 5-second deadline; downloads share an 8-second network-time budget
+and an eight-image count cap. Deadlines are updated before each blocking read.
+IR delivery and CPU conversion time do not consume that download budget.
 Cancelled sinks abort conversion and further image fetches; socket writes have
 a stall timeout. These bounds do not establish progressive drawing in Xiino or
 an overall wall-clock bound on a healthy but slow IR transfer.

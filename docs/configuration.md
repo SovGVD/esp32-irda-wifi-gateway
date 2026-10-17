@@ -24,8 +24,8 @@ Firmware settings are in [`include/config.h`](../include/config.h). Google scope
 | `XIINO_MAX_IMAGE_BYTES` | 64000 | Maximum compressed image download |
 | `XIINO_MAX_IMAGE_PIXELS` | `153 * 1024` | Resized image pixel cap; shared 192 KiB decoder allocation budget and free-heap checks can reject smaller images |
 | `XIINO_PAGE_TIMEOUT_MS` | 20000 | Total origin page download deadline, including redirects and reads |
-| `XIINO_IMAGE_TIMEOUT_MS` | 3000 | Deadline for each optional image download |
-| `XIINO_IMAGES_TIMEOUT_MS` / `XIINO_MAX_IMAGES` | 8000 / 8 | Shared elapsed image-attempt budget and maximum attempted images per page |
+| `XIINO_IMAGE_TIMEOUT_MS` | 5000 | Deadline for each optional image download |
+| `XIINO_IMAGES_TIMEOUT_MS` / `XIINO_MAX_IMAGES` | 8000 / 8 | Total image download time (excludes IR delivery/CPU) and maximum attempted images per page |
 | `PPP_GATEWAY_IP` / `PPP_PALM_IP` | `192.168.99.1` / `.2` | Addresses on the link between adapter and Palm |
 | `MAIL_PC_ANSWER_TIMEOUT_MS` | 1500 | How long a HotSync waits for a desktop on USB before standalone Drive / Mail / Tasks / Calendar / Contacts sync |
 | `MAIL_DEFAULT_IMAP_SERVER` / `MAIL_DEFAULT_SMTP_SERVER` | Gmail's | Mail servers until others are entered in the portal |
