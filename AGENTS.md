@@ -1,91 +1,104 @@
 # Notes for AI coding agents
 
-Firmware for an ESP32-C3 with a Vishay TFBS4711 infrared transceiver that acts as an IrDA adapter for a Palm IIIx. One firmware does three jobs: HotSync to a Linux host over USB CDC, Internet for the Palm (PPP routed onto Wi-Fi with NAT, plus a portal and web proxy), and a built-in Mail conduit that syncs the Palm's Mail application with an IMAP / SMTP account (including Gmail with Google OAuth / XOAUTH2).
+Firmware for an ESP32-C3 with a Vishay TFBS4711 infrared transceiver that acts as an IrDA adapter for a Palm (IIIx and Palm OS 4 devices). One firmware does three jobs:
 
-`README.md` is the user manual (wiring, setup, every user-visible behaviour, configuration table). Read it before changing behaviour, and update it in the same change when behaviour or settings change.
+- **Desktop HotSync**: the Palm's IrCOMM stream is bridged to USB CDC, so `pilot-link` / `jpilot` on Linux see a serial Palm.
+- **Internet for the Palm**: PPP terminated on the ESP32 and routed onto Wi-Fi with NAT, plus a settings portal, DNS, a web proxy and an OpenXiino DataServer port for the Xiino browser.
+- **Standalone HotSync**: when no desktop answers, the adapter speaks the desktop side of HotSync itself and runs conduits over Wi-Fi: Mail (IMAP / SMTP, Gmail via XOAUTH2), and Google Tasks, Calendar, Contacts, Docs (Memo Pad), Drive PNG (Note Pad), Sheets (Expense) and Drive backup / restore, all sharing one Google sign-in.
 
-## Source layout
+## Where the documentation is
 
-```
-include/config.h      All compile-time settings (pins, baud, buffer sizes, timeouts, feature flags)
-src/main.cpp          setup() / loop(): IrLAP state handling, LED, routing of each IrCOMM session
-src/irphy.cpp         IrPHY: SIR pulses through the hardware UART, transceiver shutdown pin
-src/irlap.cpp         IrLAP: framing, FCS, XID discovery, SNRM, parameter negotiation, ack / retransmit
-src/irlmp.cpp         IrLMP and IAS (answers queries for "IrDA:IrCOMM")
-include/irttp.h       TinyTP header and credit constants (logic lives in ircomm.cpp)
-src/ircomm.cpp        IrCOMM over TinyTP with credit flow control
-src/irppp.cpp         PPP server on lwIP towards the Palm, NAT onto Wi-Fi
-src/irportal.cpp      Wi-Fi manager (saved networks, retries), HTTP portal (HTML / WML), DNS server,
-                      web proxy, Mail settings pages, Google sign-in pages for a PC
-src/irmail.cpp        Mail conduit glue on the ESP32: NVS settings, TLS connections (esp_tls), FreeRTOS task
-src/hotsync.cpp       Desktop side of HotSync: SLP, PADP, CMP, DLP          (host-testable)
-src/mailsync.cpp      The conduit logic: Outbox -> SMTP, IMAP -> Inbox, read / deleted both ways  (host-testable)
-src/mailnet.cpp       IMAP and SMTP clients over an abstract MailConnection (host-testable)
-src/mailoauth.cpp     Google OAuth 2.0 (PKCE, token refresh, XOAUTH2 strings)  (host-testable)
-src/mailtext.cpp      Palm Mail record format, charsets, MIME, HTML to text, headers, dates (host-testable)
-src/irdebug.cpp       Protocol trace over USB, enabled with ENABLE_CDC_DEBUG
-test/host/            Host-side tests (see below)
-udev/                 udev rule for the Linux host (/dev/palm-irda, ModemManager off)
-case/                 FreeCAD case design (make_case.py) and its exported STL / STEP / 3MF
-```
+- `README.md`: project overview and features.
+- `docs/`: user guides (hardware, building, HotSync, Internet, Mail, `docs/google/*` per service), `docs/configuration.md` (every `config.h` setting) and `docs/troubleshooting.md`.
+- `docs/development.md`: architecture, the full per-file source map, what each host test covers, and the **validation status** (which features the owner has confirmed on a real Palm, and which only have host-test coverage). Read it before changing a conduit.
+- `third_party/README.md`: provenance and local changes of the vendored code.
 
-## How a connection is routed
+When behaviour or a setting changes, update the matching guide in `docs/` in the same change. When a change affects what has been confirmed on hardware, update the validation status in `docs/development.md` and say plainly what still needs a device retest.
 
-`main.cpp` runs the IrLAP / IrLMP / IrCOMM stack in `loop()`. When an IrCOMM session opens, the first byte the Palm sends decides where it goes (`route_palm_data()`):
+## How the code is organised
 
-- `0x7E` (PPP flag): the session goes to `irppp` (Wi-Fi gateway), if `ENABLE_WIFI_GATEWAY` is on.
-- Anything else, including HotSync (`0xBE`): bridged to USB CDC. If it is a HotSync and the USB host has not answered within `MAIL_PC_ANSWER_TIMEOUT_MS`, the session is handed to the mail conduit (`hand_over_to_mail()`), which replays the opening bytes it saw.
+All sources are flat in `src/` and `include/`; the ESP-IDF component in `src/CMakeLists.txt` globs every `src/*.cpp` plus the libwebp and pngle sources from `third_party/`.
 
-The mail conduit and the portal's HTTP and DNS servers run in their own FreeRTOS tasks; the IrDA stack must never block in `loop()`, because IrLAP turnaround times are tight. Debug output is buffered and drained from `loop()` for the same reason.
+**IrDA stack and routing (ESP32 only).** `irphy` (UART SIR), `irlap`, `irlmp` (IAS), `ircomm` (with TinyTP from `irttp.h`), driven from `loop()` in `main.cpp`. The first byte of each IrCOMM session decides where it goes in `route_palm_data()`: `0x7E` goes to PPP (`irppp`); anything else is bridged to USB, and a HotSync (`0xBE`) that the USB host leaves unanswered for `MAIL_PC_ANSWER_TIMEOUT_MS` is handed to the standalone sync in `irmail.cpp`, which replays the opening bytes.
 
-## Two kinds of code
+**Standalone sync.** `irmail.cpp` owns the FreeRTOS task that accepts the HotSync (`hotsync.cpp`: SLP, PADP, CMP, DLP) and then runs each enabled conduit in turn: Drive restore, Mail, Tasks, Calendar, Contacts, Memo / Note, Expenses, Drive backup. `syncdiagnostics` / `irsyncdiag` record stage breadcrumbs and heap figures in RTC memory so a crash can be diagnosed after reset.
 
-1. **ESP32-only** (`main`, `ir*.cpp`): uses Arduino (`String`, `Preferences`, `WiFi`), ESP-IDF (`esp_tls`, lwIP) and FreeRTOS. It can only be checked by building the firmware.
-2. **Portable** (`hotsync`, `mailsync`, `mailnet`, `mailoauth`, `mailtext` and their headers): plain C++17 with `std::string` / `std::vector`, no Arduino or ESP-IDF includes. I/O goes through injected interfaces (`HotSync_Io`, `MailConnection`) so the host tests can drive it. Keep it that way: do not include `Arduino.h` or `config.h` (which includes `Arduino.h`) from these files, and put new protocol or text logic here rather than in the `ir*.cpp` glue when it can be tested on a host.
+**Each Google conduit has the same four layers:**
+
+| Layer | Example (Calendar) | Depends on ESP32? |
+|:------|:-------------------|:-----------------|
+| `ir<service>.cpp`: settings in NVS (`Preferences`), portal hooks, wiring to the shared HTTPS transport | `ircalendar.cpp` | yes |
+| `<service>sync.cpp`: the two-way sync, mappings, conflicts, journals | `calendarsync.cpp` | no |
+| `<service>text.cpp`: the Palm database record codec | `calendartext.cpp` | no |
+| `google<service>.cpp`: REST client over the `GoogleHttp` interface | `googlecalendar.cpp` | no |
+
+Mail follows the same split with `irmail` / `mailsync` / `mailtext` / `mailnet` (over the abstract `MailConnection`). Drive backup uses `irdrive` / `drivebackup` / `palmbackup` / `googledrive`; Memo and Note Pad share `irnotes` / `notesync` / `notetext` / `noteimage` / `googlenotes`.
+
+**Google sign-in** is shared: `mailoauth.cpp` (consent URL, PKCE, token refresh, XOAUTH2), scopes in `include/googlescopes.h` (`GOOGLE_SCOPES` in `config.h`), and the refresh token stored with the mail settings in `irmail.cpp`. The sign-in pages for a PC are in `irportal.cpp`. `irgooglehttp.cpp` is the one ESP32 HTTPS adapter behind `GoogleHttp` (bounded responses, HotSync keep-alives while waiting).
+
+**Portal and web.** `irportal.cpp` holds the Wi-Fi manager, the HTML / WML portal, DNS, the direct web proxy and the settings pages of every conduit. Xiino support is `xiino.cpp` (HTML conversion), `xiinoimage.cpp` (image decoding to the Xiino palette), `xiinosource.cpp` and `irxiino.cpp` (ESP32 transport), with a bounded allocator in `xiinoalloc.h`.
+
+**Portable code** (everything without an `ir` prefix, apart from `main.cpp`) is plain C++17 with `std::string` / `std::vector` and no Arduino or ESP-IDF includes, so the host tests can build it. Do not include `Arduino.h` or `config.h` (which includes `Arduino.h`) there; pass limits in from the `ir*` adapter instead. Put new logic in the portable layer whenever it can be tested on a computer.
 
 ## Building
 
 ```bash
-pio run              # build the firmware
-pio run -t upload    # flash (hold BOOT while plugging in if the upload cannot reach the board)
+pio run              # build the firmware (first build compiles ESP-IDF from source, several minutes)
+pio run -t upload    # flash
 pio device monitor   # serial monitor (useful with ENABLE_CDC_DEBUG 1)
 ```
 
-- `framework = arduino, espidf`: ESP-IDF is compiled from source with `sdkconfig.defaults` because the prebuilt Arduino SDK lacks PPP, IP forwarding and NAT. The first build takes several minutes. `sdkconfig.esp32*` files are generated; do not commit them. Change `sdkconfig.defaults` instead.
-- The root `CMakeLists.txt` and `src/CMakeLists.txt` exist for the ESP-IDF build PlatformIO runs; new `.cpp` files in `src/` are picked up by the glob.
-- `include/wifi_secrets.h` is optional and git-ignored (default `WIFI_SSID` / `WIFI_PASSWORD`). Never commit credentials.
-- Flash layout is in `partitions.csv` (one 3 MB factory app, no OTA). Watch the image size when adding large features.
+- `framework = arduino, espidf` with `sdkconfig.defaults`, because the prebuilt Arduino SDK lacks PPP, IP forwarding and NAT. Generated `sdkconfig.esp32*` files are git-ignored; change `sdkconfig.defaults` instead.
+- `include/wifi_secrets.h` is optional and git-ignored. Never commit credentials, OAuth clients or tokens.
+- `partitions.csv` has one 3 MB factory app and no OTA. Watch the image size.
+- `src/xiino_assets.inc` and `src/xiino_palette.inc` are generated by `tools/generate_xiino_assets.py`; `test/host/data/xiino_codec_fixtures.h` by `tools/generate_xiino_codec_fixtures.py` (needs Pillow). Regenerate them rather than editing by hand.
 
 ## Host-side tests
 
 ```bash
-test/host/run.sh     # needs g++ and python3; about a minute
+test/host/run.sh     # everything; runs test/host/xiino.sh first. About 8 minutes.
+sh test/host/xiino.sh   # only the Xiino converter and transport
 ```
 
-It compiles each portable module with `-Wall -Wextra -fsanitize=address,undefined` and runs:
+Needs `g++`, `cc`, `python3` and zlib headers. Everything is built with `-fsanitize=address,undefined`. Besides that, `run.sh` needs two sources from the ESP-IDF package that `pio run` downloads:
 
-- `mailtext_test`, `mailnet_test`, `mailoauth_test`: unit tests; the mail and Google servers are `ScriptedServer` (`scripted_server.h`), which checks the client's exact bytes and replies in small pieces to exercise parsing across packet boundaries.
-- `hotsync_test` against `fake_palm.py` (a simulated Palm on a pseudo terminal). The DLP requests must match `test/host/data/pilot-link-requests.txt` byte for byte (what real `pilot-link` sent), then the sync is repeated with every packet dropped or ignored once.
-- `mailsync_test`: whole conduit runs (`normal`, `bad-imap`, `offline`, `oauth`, `changes`). The Palm's database afterwards must equal `test/host/data/mailsync-<scenario>.json`.
+- **cJSON**: found at `~/.platformio/packages/framework-espidf/components/json/cJSON`, or set `CJSON_DIR`.
+- **miniz** from esptool's `flasher_stub`: found next to it, or set `MINIZ_DIR`.
 
-When a change intentionally alters what the conduit writes or requests, update the expected data files and say why in the commit. To add a source file to a test, add it to the matching `g++` line in `run.sh`. A new `.cpp` added to `src/` is built into the firmware automatically, but `run.sh` lists its files by hand.
+If PlatformIO cannot download (see below), clone them instead; this is enough for the whole suite to pass:
+
+```bash
+git clone --depth 1 https://github.com/DaveGamble/cJSON.git /tmp/deps/cJSON
+git clone --depth 1 -b v4.7.0 https://github.com/espressif/esptool.git /tmp/deps/esptool
+CJSON_DIR=/tmp/deps/cJSON MINIZ_DIR=/tmp/deps/esptool/flasher_stub test/host/run.sh
+```
+
+How the tests work:
+
+- Conduits run real HotSyncs against simulated Palms on a pseudo terminal (`fake_palm.py`, `fake_backup_palm.py`, `fake_notes_palm.py`, `fake_expenses_palm.py`) and in-memory Google APIs or scripted servers (`scripted_server.h`, `drive_server.h`).
+- The base HotSync requests must equal what real `pilot-link` sent (`test/host/data/pilot-link-requests.txt`), and the sync is repeated with every packet lost once in each direction.
+- Whole mail syncs compare the Palm's database afterwards with `test/host/data/mailsync-<scenario>.json`.
+- The real ESP32 HTTPS adapters (`irgooglehttp.cpp`, `irxiino.cpp`) are tested against SDK shims in `test/host/esp_http_stubs/`.
+
+A new source file is built into the firmware automatically, but `run.sh` and `xiino.sh` list the files of each test by hand: add it there too. When a change intentionally alters what a conduit writes or requests, update the expected data and say why in the commit.
 
 ## Conventions
 
-- Match the surrounding code: 4-space indent, `snake_case` functions prefixed with their module (`irppp_start`, `hotsync_accept`), `s_` for file-static state, `UPPER_CASE` macros. Settings belong in `include/config.h` with a comment, and user-visible ones also go in the README configuration table.
-- Comments and README text are plain, full English sentences that say what something does and why, written for the owner of the device. Avoid jargon in user-facing text (portal pages, HotSync log lines, README).
-- Memory is small (ESP32-C3, ~400 KB RAM, no PSRAM). Prefer fixed buffers and the limits in `config.h` / module headers; mind task stack sizes (TLS needs about 16 KB).
-- Persistent settings use `Preferences` (NVS): namespace `irda` for Wi-Fi and portal settings, `irmail` for mail. Keep existing keys readable when changing what is stored.
-- USB CDC carries the raw HotSync byte stream. Nothing may print to `Serial` in normal builds; use `irdbg_printf()` (compiled out unless `ENABLE_CDC_DEBUG`).
-- The portal is reachable from the Palm (PPP side) only, except the Google sign-in pages during `GOOGLE_SETUP_WINDOW_MS`. Do not expose other pages to the Wi-Fi side.
+- Match the file you are editing. Older modules use 4-space indent and spaced code; newer conduit code is denser. Functions are `snake_case` prefixed with their module (`irtasks_sync`, `hotsync_accept`), file-static state is `s_`, macros are `UPPER_CASE`.
+- Settings go in `include/config.h` with a comment, and user-visible ones in `docs/configuration.md`.
+- Persistent state uses `Preferences` (NVS), one namespace per area (`irda` for Wi-Fi and portal, `irmail`, `irtasks`, `irexpenses`, ...). Keep existing keys readable when changing what is stored; sync state that must survive an interrupted HotSync uses journals.
+- Docs, comments, portal pages and HotSync log lines are plain, full English sentences written for the owner of the device.
 - Commit messages: a short imperative subject, then a body explaining the user-visible effect and the reason.
 
 ## Gotchas
 
-- **No CI.** Nothing checks a pull request automatically. Run `test/host/run.sh` yourself and, where possible, `pio run`.
-- **PlatformIO downloads may be blocked in sandboxes.** `pip install platformio` works, but `pio run` then needs to download the espressif32 platform and toolchains, which fails behind restrictive network proxies (`HTTPClientError`). If you cannot build, say so plainly, and be extra careful with ESP32-only code: check APIs against the ESP-IDF / Arduino-ESP32 versions the platform uses.
-- **Hardware testing is manual.** Many features (mail sync, web proxy) have only been checked in host tests, as noted in the README. Do not claim something works on a real Palm unless the user has confirmed it.
-- `ENABLE_CDC_DEBUG 1` replaces the HotSync serial stream with the trace; `pilot-xfer` will not work in that build. Ship with `0`.
-- IrLAP timing: code on the IR path (`main.cpp`, `irlap`, `irlmp`, `ircomm`, `irphy`) must not block or allocate heavily; long work goes in the mail or portal tasks.
-- The Palm's text is one byte per character (Windows-1252, or 1251 with the Cyrillic option); Mail bodies are limited to 8000 characters (`MAILSYNC_BODY_MAX`).
-- Gmail OAuth uses the owner's own Desktop OAuth client and the loopback redirect `http://127.0.0.1` (the user pastes the redirected address back). The scope must stay `https://mail.google.com/`: IMAP and SMTP accept no narrower scope.
+- **No CI.** Nothing checks a pull request automatically. Run `test/host/run.sh` yourself, and `pio run` where you can.
+- **PlatformIO downloads may be blocked in sandboxes.** `pip install platformio` works, but the registry (`api.registry.platformio.org`) can be unreachable behind restrictive proxies, so `pio run` fails with `HTTPClientError` and the ESP32 build cannot be checked. Say so plainly when that happens, take extra care with ESP32-only code, and use the cloned cJSON / miniz above for the host tests.
+- **Memory is the main constraint.** ESP32-C3, about 400 KB RAM, no PSRAM, and a fragmented heap during TLS (device reports show a largest free block near 38 KB). Avoid whole-body or whole-page copies, stream where possible, and respect the HTTPS response caps and the Xiino allocator. Several past device failures were allocation failures that host tests only caught once a heap model was added.
+- **Hardware testing is manual.** Never claim something works on a real Palm unless the owner confirmed it; record it in the validation status in `docs/development.md`.
+- **USB carries the raw HotSync stream.** Nothing may print to `Serial` in normal builds; use `irdbg_printf()`, compiled in only with `ENABLE_CDC_DEBUG 1` (which also breaks `pilot-xfer`; ship with `0`).
+- **IrLAP timing.** Code on the IR path (`main.cpp`, `irlap`, `irlmp`, `ircomm`, `irphy`) must not block or allocate heavily; long work belongs in the sync or portal tasks.
+- **Palm text** is one byte per character (Windows-1252, or 1251 with the Cyrillic option).
+- **Google sign-in** uses the owner's own Desktop OAuth client and the loopback redirect `http://127.0.0.1` (the owner pastes the redirected address back). All scopes are requested in one consent (`GOOGLE_DEFAULT_SCOPES`); adding a scope means the owner must sign in again and add it in their Cloud project, so document that in `docs/google/README.md`.
+- **The portal** is reachable from the Palm only, except the Google sign-in pages during `GOOGLE_SETUP_WINDOW_MS`. Do not expose other pages to the Wi-Fi side.
+- `third_party/` is vendored with small, documented local changes. Record any further change in `third_party/README.md`.
