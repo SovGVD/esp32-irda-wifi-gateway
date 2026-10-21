@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <string>
 #include "mailnet.h"
+#include "googlescopes.h"
 
 // Google sign-in (OAuth 2.0) for the mail account, instead of an app password.
 // The owner signs in once from a PC browser; the adapter keeps the refresh
@@ -24,6 +25,7 @@
 struct OAuthTokens {
     std::string access_token;
     std::string refresh_token;  // Only when a code is exchanged
+    std::string scope;          // Space-separated scopes granted by Google
     uint32_t expires_in = 0;    // Seconds the access token is valid
 };
 
@@ -32,6 +34,9 @@ std::string mail_xoauth2(const std::string &user, const std::string &access_toke
 
 // Percent-encoding for addresses and forms: everything but A-Z a-z 0-9 - . _ ~
 std::string oauth_encode(const std::string &text);
+
+// Exact scope membership, also used by the Google service clients.
+bool oauth_has_scope(const std::string &granted, const std::string &scope);
 
 // PKCE S256 challenge of a verifier: BASE64URL(SHA-256(verifier)), no padding
 std::string oauth_pkce_challenge(const std::string &verifier);

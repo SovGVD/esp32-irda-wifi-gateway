@@ -36,6 +36,46 @@ static void test_pieces() {
            "&redirect_uri=http%3A%2F%2F127.0.0.1&scope=https%3A%2F%2Fmail.google.com%2F&code_challenge=E9Mel"
            "&code_challenge_method=S256&state=st8&access_type=offline&prompt=consent&login_hint=me%40gmail.com");
 
+    const std::string scopes = GOOGLE_DEFAULT_SCOPES;
+    expect("planned services", scopes,
+           "https://mail.google.com/ https://www.googleapis.com/auth/tasks "
+           "https://www.googleapis.com/auth/contacts https://www.googleapis.com/auth/calendar "
+           "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/documents "
+           "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/presentations "
+           "https://www.googleapis.com/auth/userinfo.profile");
+    std::string consent = oauth_consent_url("client", scopes, "challenge", "state", "");
+    expect_true("all services in one consent request",
+        consent.find("&scope=https%3A%2F%2Fmail.google.com%2F"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Ftasks"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcontacts"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdocuments"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fspreadsheets"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fpresentations"
+                     "%20https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fuserinfo.profile&") != std::string::npos);
+    expect_true("Contacts grant", oauth_has_scope(scopes, GOOGLE_CONTACTS_SCOPE));
+    expect_true("Contacts account identity grant", oauth_has_scope(scopes, GOOGLE_PROFILE_SCOPE));
+    expect_true("Contacts grant alone does not grant account profile", !oauth_has_scope(GOOGLE_CONTACTS_SCOPE, GOOGLE_PROFILE_SCOPE));
+    expect_true("Calendar grant", oauth_has_scope(scopes, GOOGLE_CALENDAR_SCOPE));
+    expect_true("Drive grant", oauth_has_scope(scopes, GOOGLE_DRIVE_SCOPE));
+    expect_true("Docs grant", oauth_has_scope(scopes, GOOGLE_DOCS_SCOPE));
+    expect_true("Sheets grant", oauth_has_scope(scopes, GOOGLE_SHEETS_SCOPE));
+    expect_true("Slides grant", oauth_has_scope(scopes, GOOGLE_SLIDES_SCOPE));
+    expect_true("read-only Docs grant does not authorize changes",
+        !oauth_has_scope("https://www.googleapis.com/auth/documents.readonly", GOOGLE_DOCS_SCOPE));
+    expect_true("read-only Sheets grant does not authorize changes",
+        !oauth_has_scope("https://www.googleapis.com/auth/spreadsheets.readonly", GOOGLE_SHEETS_SCOPE));
+    expect_true("read-only Slides grant does not authorize changes",
+        !oauth_has_scope("https://www.googleapis.com/auth/presentations.readonly", GOOGLE_SLIDES_SCOPE));
+    expect_true("read-only grant does not authorize changes",
+        !oauth_has_scope("https://www.googleapis.com/auth/contacts.readonly", GOOGLE_CONTACTS_SCOPE));
+    expect_true("per-file Drive grant does not authorize all files",
+        !oauth_has_scope("https://www.googleapis.com/auth/drive.file", GOOGLE_DRIVE_SCOPE));
+    expect_true("separated grants", oauth_has_scope("\t https://www.googleapis.com/auth/tasks \n", GOOGLE_TASKS_SCOPE));
+    expect_true("missing grant", !oauth_has_scope(GOOGLE_MAIL_SCOPE, GOOGLE_TASKS_SCOPE));
+    expect_true("empty grant", !oauth_has_scope("", GOOGLE_DRIVE_SCOPE) && !oauth_has_scope(scopes, ""));
+
     std::string code, problem;
     expect_true("reply address", oauth_code_from_reply(" http://127.0.0.1/?state=st8&code=4%2F0AeanS0b-x_y&scope=https%3A%2F%2Fmail.google.com%2F \n",
                                                        "st8", code, problem));
@@ -94,9 +134,30 @@ static void test_token_server(size_t piece) {
         OAuthTokens tokens;
         expect_true("exchange", google.exchange_code(id, secret, "4/0Ab", "verifier-1", tokens));
         expect_true("exchange tokens", tokens.access_token == "ya29.first" && tokens.refresh_token == "1//0g-refresh" &&
-                                       tokens.expires_in == 3599);
+                                       tokens.expires_in == 3599 && tokens.scope == GOOGLE_MAIL_SCOPE);
+        expect_true("old mail grant stays mail-only", !oauth_has_scope(tokens.scope, GOOGLE_CONTACTS_SCOPE));
+        expect_true("old token does not gain profile permission", !oauth_has_scope(tokens.scope, GOOGLE_PROFILE_SCOPE));
         expect_true("exchange script", server.finished("exchange") && server.closed_ && server.host_ == "oauth2.googleapis.com" &&
                                        server.port_ == 443);
+    }
+    {
+        // Retain the complete shared grant; the mail-only case above also
+        // verifies that a usable token does not imply every API was granted.
+        std::string body = "{\"access_token\":\"ya29.shared\",\"refresh_token\":\"refresh-shared\",\"scope\":\"" +
+                           std::string(GOOGLE_DEFAULT_SCOPES) + "\",\"expires_in\":3599}";
+        ScriptedServer server({{"", ""}, {request(k_exchange_form), answer("200 OK", body)}}, piece);
+        OAuthClient google(server, idle);
+        OAuthTokens tokens;
+        expect_true("shared exchange", google.exchange_code(id, secret, "4/0Ab", "verifier-1", tokens));
+        expect_true("shared scopes retained", tokens.scope == GOOGLE_DEFAULT_SCOPES &&
+                    oauth_has_scope(tokens.scope, GOOGLE_CONTACTS_SCOPE) &&
+                    oauth_has_scope(tokens.scope, GOOGLE_PROFILE_SCOPE) &&
+                    oauth_has_scope(tokens.scope, GOOGLE_CALENDAR_SCOPE) &&
+                    oauth_has_scope(tokens.scope, GOOGLE_DRIVE_SCOPE) &&
+                    oauth_has_scope(tokens.scope, GOOGLE_DOCS_SCOPE) &&
+                    oauth_has_scope(tokens.scope, GOOGLE_SHEETS_SCOPE) &&
+                    oauth_has_scope(tokens.scope, GOOGLE_SLIDES_SCOPE));
+        expect_true("shared exchange script", server.finished("shared exchange") && server.closed_);
     }
     {
         ScriptedServer server({{"", ""}, {request(k_refresh_form), answer("200 OK", "{\"access_token\":\"ya29.second\",\"expires_in\":3599}", true)}},

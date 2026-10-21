@@ -1,11 +1,25 @@
 #include "irportal.h"
 #include "irppp.h"
 #include "irmail.h"
+#include "irsyncdiag.h"
+#include "irtasks.h"
+#include "ircalendar.h"
+#include "ircontacts.h"
+#include "irdrive.h"
+#include "irnotes.h"
+#include "irexpenses.h"
+#include "irhotsync.h"
 #include "irdebug.h"
+#include "irxiino.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_ota_ops.h"
+#include "nvs.h"
 #include <lwip/sockets.h>
 #include <lwip/inet.h>
 
@@ -68,11 +82,19 @@ static String s_request_host;      // Site the browser asked for (address or Hos
 static String s_request_agent;     // Browser identification, passed on by the proxy
 static String s_request_method;    // GET or POST
 static String s_request_body;      // Form fields of a POST, passed on by the proxy
+static XiinoRequest s_xiino_request;
+static uint32_t s_dataserver_pages=0,s_direct_pages=0;
 
 // Google sign-in from a PC: the sign-in pages answer on the Wi-Fi side while
 // this is open (opened from the Palm's Mail page, for GOOGLE_SETUP_WINDOW_MS)
 static bool s_google_window_open = false;
 static uint32_t s_google_window_since = 0;
+static bool s_google_from_tasks = false;
+static bool s_google_from_calendar = false;
+static bool s_google_from_contacts = false;
+static bool s_google_from_drive = false;
+static int s_google_from_notes = -1;
+static bool s_google_from_expenses = false;
 
 // Web proxy for all sites (see the proxy section); switched from the status page
 static bool s_proxy_all_sites = PROXY_ALL_SITES_DEFAULT;
@@ -497,9 +519,7 @@ static String request_sole_field(const char *name) {
 }
 
 // Returns false once the browser has gone away
-static bool send_all(const String &text) {
-    const char *data = text.c_str();
-    size_t left = text.length();
+static bool send_bytes(const char *data, size_t left) {
     while (left > 0) {
         int sent = send(s_client, data, left, 0);
         if (sent <= 0) {
@@ -511,12 +531,22 @@ static bool send_all(const String &text) {
     return true;
 }
 
-static void respond(const char *status, const char *content_type, const String &body) {
+static bool send_all(const String &text) {
+    return send_bytes(text.c_str(), text.length());
+}
+
+static void respond_bytes(const char *status, const char *content_type, const char *body, size_t length) {
     // Plain HTTP/1.0: one reply, exact length, then the connection is closed
     String headers = String("HTTP/1.0 ") + status + "\r\nContent-Type: " + content_type +
-                     "\r\nContent-Length: " + String((unsigned)body.length()) +
+                     "\r\nContent-Length: " + String((unsigned)(length + (s_xiino_request.dataserver ? 16 : 0))) +
                      "\r\nPragma: no-cache\r\nConnection: close\r\n\r\n";
-    send_all(headers + body);
+    if (!send_all(headers)) return;
+    if (s_xiino_request.dataserver && !send_bytes(xiino_padding().data(), xiino_padding().size())) return;
+    send_bytes(body, length);
+}
+
+static void respond(const char *status, const char *content_type, const String &body) {
+    respond_bytes(status, content_type, body.c_str(), body.length());
 }
 
 class Page {
@@ -560,6 +590,12 @@ public:
         out_ += wml_ ? "<p>" : "<P>";
         out_ += escape(text, wml_);
         out_ += wml_ ? "</p>\r\n" : "</P>\r\n";
+    }
+
+    void heading(const String &text) {
+        out_ += wml_ ? "<p><b>" : "<H4>";
+        out_ += escape(text,wml_);
+        out_ += wml_ ? "</b></p>\r\n" : "</H4>\r\n";
     }
 
     void link(const String &href, const String &label) {
@@ -610,7 +646,7 @@ public:
                 out_ += String("<p>") + fields[i].label + ": <input name=\"" + fields[i].name + "\" value=\"" +
                         escape(fields[i].value, true) + "\"/></p>\r\n";
             }
-            out_ += String("<p><anchor>") + button + "<go href=\"" + action + "\" method=\"get\">";
+            out_ += String("<p><anchor>") + button + "<go href=\"" + action + "\" method=\"" + (post ? "post" : "get") + "\">";
             for (size_t i = 0; i < count; i++) {
                 out_ += String("<postfield name=\"") + fields[i].name + "\" value=\"$(" + fields[i].name + ")\"/>";
             }
@@ -687,16 +723,27 @@ static void handle_status() {
     }
 
     if (s_proxy_all_sites) {
-        page.line("Web proxy: on. Pages are fetched by the adapter, so https sites work; pictures are left out.");
+        page.line("Web proxy: on. Direct browser pages omit pictures. Xiino DataServer includes converted pictures.");
         page.link("/proxy/0", "Turn web proxy off");
     } else {
         page.line("Web proxy: off. The Palm connects to sites itself: plain http only, but other programs (mail, telnet) work.");
         page.link("/proxy/1", "Turn web proxy on");
     }
+    page.line("Xiino DataServer: " XIINO_DATASERVER_HOST " (OpenXiino).");
+    page.link("http://about/", "About OpenXiino (Xiino DataServer mode)");
 
     const IrMailSettings &mail = irmail_settings();
     page.link("/mail", mail.address.length() == 0 ? String("Mail: not set up")
-                                                  : String(irmail_ready() ? "Mail: on, " : "Mail: off, ") + mail.address);
+                                                  : String(irmail_enabled() ? "Mail: on, " : "Mail: off, ") + mail.address);
+
+    page.link("/calendar", ircalendar_ready() ? "Google Calendar: on" : "Google Calendar: off");
+    page.link("/contacts", ircontacts_ready() ? "Address Book: on" : "Address Book: off");
+    page.link("/tasks", irtasks_ready() ? "Google Tasks: on" : "Google Tasks: off");
+    page.link("/memos",irnotes_ready(false) ? "Memo Pad: on" : "Memo Pad: off");
+    page.link("/notes",irnotes_ready(true) ? "Note Pad: on" : "Note Pad: off");
+    page.link("/expenses",irexpenses_ready() ? "Expenses: on" : "Expenses: off");
+    page.link("/drive", irdrive_ready() ? "Drive backup: on" : "Drive backup: off");
+    page.link("/hotsync","HotSync settings (user name)");
 
     page.link("/", "Refresh");
     page.link("/nets", "Add Wi-Fi network");
@@ -790,10 +837,116 @@ static void handle_networks(bool rescan) {
     page.send();
 }
 
+static String diagnostic_bytes(size_t bytes) {
+    return String((unsigned long)bytes)+" B ("+String(bytes/1024.0,1)+" KiB)";
+}
+
+static const char *reset_reason_name(esp_reset_reason_t reason) {
+    switch (reason) {
+    case ESP_RST_POWERON: return "power on";
+    case ESP_RST_EXT: return "external reset";
+    case ESP_RST_SW: return "software reset";
+    case ESP_RST_PANIC: return "crash/panic";
+    case ESP_RST_INT_WDT: return "interrupt watchdog";
+    case ESP_RST_TASK_WDT: return "task watchdog";
+    case ESP_RST_WDT: return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "wake from deep sleep";
+    case ESP_RST_BROWNOUT: return "power brownout";
+    case ESP_RST_SDIO: return "SDIO reset";
+    default: return "unknown";
+    }
+}
+
+static void show_esp_status(Page &page,const multi_heap_info_t &heap,uint64_t uptime_seconds) {
+    page.heading("ESP status");
+    page.line(String("Chip: ")+ESP.getChipModel()+", revision "+String(ESP.getChipRevision())+
+              ", cores: "+String(ESP.getChipCores()));
+    page.line("CPU clock: "+String(getCpuFrequencyMhz())+" MHz; tasks: "+String((unsigned)uxTaskGetNumberOfTasks()));
+    char uptime[64];
+    snprintf(uptime,sizeof(uptime),"%lu days %02u:%02u:%02u",(unsigned long)(uptime_seconds/86400),
+             (unsigned)(uptime_seconds/3600%24),(unsigned)(uptime_seconds/60%60),(unsigned)(uptime_seconds%60));
+    page.line(String("Uptime: ")+uptime);
+    page.line(String("Last reset: ")+reset_reason_name(esp_reset_reason()));
+
+    const size_t total=heap.total_allocated_bytes+heap.total_free_bytes;
+    page.line("Internal heap used: "+diagnostic_bytes(heap.total_allocated_bytes)+
+              " ("+String(total ? heap.total_allocated_bytes*100.0/total : 0.0,1)+"%)");
+    page.line("Heap total: "+diagnostic_bytes(total));
+    page.line("Heap free: "+diagnostic_bytes(heap.total_free_bytes));
+    page.line("Lowest free heap since boot: "+diagnostic_bytes(heap.minimum_free_bytes));
+    page.line("Largest allocatable heap block: "+diagnostic_bytes(heap.largest_free_block));
+    page.line("External requests since boot: Xiino DataServer "+String((unsigned long)s_dataserver_pages)+
+              ", direct proxy "+String((unsigned long)s_direct_pages));
+    page.line(String(irxiino_diagnostics().c_str()));
+    std::string interrupted=irxiino_previous_diagnostics();
+    if (!interrupted.empty()) page.line(String(interrupted.c_str()));
+    page.line(String(xiino_image_diagnostics().c_str()));
+    if (ESP.getPsramSize()) {
+        page.line("PSRAM total: "+diagnostic_bytes(ESP.getPsramSize())+"; free: "+diagnostic_bytes(ESP.getFreePsram()));
+    } else page.line("PSRAM: not available");
+
+    page.line("Flash capacity: "+diagnostic_bytes(ESP.getFlashChipSize()));
+    const esp_partition_t *app=esp_ota_get_running_partition();
+    // Arduino verifies the flash image to obtain its length. Cache this once
+    // per boot rather than repeating that work on every diagnostics refresh.
+    static const uint32_t image_size=ESP.getSketchSize();
+    if (app && image_size && image_size<=app->size) {
+        page.line("Firmware image: "+diagnostic_bytes(image_size)+" ("+String(image_size*100.0/app->size,1)+"% of app partition)");
+        page.line("Unused app partition space: "+diagnostic_bytes(app->size-image_size));
+    } else page.line("Firmware image size: unavailable");
+    page.line(String("ESP-IDF version: ")+ESP.getSdkVersion());
+
+    nvs_stats_t storage={};
+    esp_err_t result=nvs_get_stats(nullptr,&storage);
+    if (result==ESP_OK) {
+        page.line("Settings storage (NVS): "+String((unsigned)storage.used_entries)+" used, "+
+                  String((unsigned)storage.free_entries)+" free, "+String((unsigned)storage.total_entries)+" total entries");
+        page.line("NVS namespaces: "+String((unsigned)storage.namespace_count));
+    } else page.line(String("Settings storage (NVS): unavailable (")+esp_err_to_name(result)+")");
+
+    page.heading("Wi-Fi and Palm link");
+    if (WiFi.status()==WL_CONNECTED) {
+        page.line("Wi-Fi: "+WiFi.SSID()+"; signal: "+String(WiFi.RSSI())+" dBm; channel: "+String(WiFi.channel()));
+        page.line("Adapter IP: "+WiFi.localIP().toString()+"; gateway: "+WiFi.gatewayIP().toString());
+    } else page.line("Wi-Fi: not connected");
+    uint32_t palm_ip=irppp_palm_ip();
+    page.line(palm_ip ? "Palm PPP: connected, "+IPAddress(palm_ip).toString() : String("Palm PPP: disconnected"));
+    page.line("PPP output queued: "+String((unsigned)irppp_pending_output())+" B");
+    page.line("PPP bytes dropped since boot: "+String((unsigned long)irppp_dropped_bytes())+" B");
+}
+
+static void show_sync_diagnostics(Page &page,bool previous) {
+    SyncDiagnosticState state;
+    if (!irsyncdiag_snapshot(state,previous)) return;
+    page.heading(previous ? "Previous HotSync diagnostics (retained across reboot)" : "HotSync diagnostics since boot");
+    page.line(String("State: ")+(state.active ? (previous ? "interrupted" : "in progress") : state.failed ? "failed" : "idle/completed"));
+    if (state.service[0]) page.line(String("Last service: ")+state.service);
+    if (state.outcome[0]) page.line(String("Result: ")+state.outcome);
+    if (state.allocation_size) {
+        page.line("Failed allocation: "+diagnostic_bytes(state.allocation_size)+"; function: "+state.allocation_function+
+                  "; capabilities: "+String(state.allocation_caps,HEX));
+    }
+    for (unsigned n=0;n<state.count;n++) {
+        const auto &e=state.events[(state.next+8-state.count+n)%8];
+        page.line(String(e.uptime_ms)+" ms: "+e.stage+"; free heap "+String(e.free_heap)+
+                  " B; largest block "+String(e.largest_block)+" B; task stack headroom "+String(e.stack_free)+" B");
+    }
+}
+
 static void handle_diagnostics() {
+    // Take the internal byte-addressable heap snapshot before allocating the
+    // page, so rendering its status text does not inflate the displayed use.
+    multi_heap_info_t heap={};
+    heap_caps_get_info(&heap,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    const uint64_t uptime_seconds=(uint64_t)(esp_timer_get_time()/1000000);
     Page page("Diagnostics");
+    page.link("/test","Refresh readings");
+    show_esp_status(page,heap,uptime_seconds);
+    show_sync_diagnostics(page,false);
+    show_sync_diagnostics(page,true);
 
     // Which names the Palm asked for and what came of it, newest first
+    page.heading("Name lookups");
     page.line("DNS server of the Wi-Fi network: " +
               (WiFi.status() == WL_CONNECTED ? WiFi.dnsIP().toString() : String("(not connected)")));
     page.line("Recent name lookups:");
@@ -890,6 +1043,181 @@ static void handle_forget(int index) {
 // Settings of the mail conduit (irmail). A HotSync cannot run while these pages
 // are open: the browser and HotSync need the same infrared link.
 
+// Google Tasks settings use the same small HTML/WML forms as Mail.
+static void handle_tasks(bool save = false) {
+    Page page("Google Tasks");
+    IrTasksSettings settings = irtasks_settings();
+    if (save) {
+        String list = request_arg("l"); list.trim();
+        settings.list_id = list.length() ? list : String("@default");
+        page.line(irtasks_store_settings(settings) ? "Saved." : "Could not save. The list cannot change after tasks have been synced.");
+        settings = irtasks_settings();
+    }
+    const IrMailSettings &google = irmail_settings();
+    if (!google.google()) page.line("Sign in with Google first.");
+    else if (!google.google_tasks()) page.line("This Google sign-in only allows mail. Sign in again to allow Tasks access.");
+    else page.line("Using the Google sign-in for " + google.address + ".");
+    page.link("/tasksgoogle", google.google() ? "Sign in with Google again (from a PC)" : "Sign in with Google (from a PC)");
+    page.line(irtasks_ready() ? "Tasks sync: on. Disconnect Network, then tap HotSync with no desktop waiting." : "Tasks sync: off.");
+    page.line("Syncs titles, notes, due dates, completion and deletions with the Palm To Do List. Private and archived tasks stay on the Palm.");
+    const Page::Field fields[] = {{"l", "Task list ID", settings.list_id}};
+    page.form("/taskssave", fields, 1, "Save", true);
+    page.link(settings.enabled ? "/taskson/0" : "/taskson/1", settings.enabled ? "Turn Tasks off" : "Turn Tasks on");
+    page.link("/taskstest", "Check Google access");
+    page.link(settings.cyrillic ? "/taskstext/0" : "/taskstext/1", settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    String result = irtasks_last_result();
+    if (result.length()) page.line("Last sync: " + result);
+    page.link("/", "Back"); page.send();
+}
+
+static void handle_calendar(bool save=false) {
+    Page page("Google Calendar");
+    IrCalendarSettings settings=ircalendar_settings();
+    if (save) {
+        String id=request_arg("c"),past=request_arg("p"),future=request_arg("f");
+        id.trim(); past.trim(); future.trim();
+        bool valid=past.length() && future.length() && past.length()<=4 && future.length()<=4;
+        for (unsigned i=0;i<past.length();i++) valid=valid && isDigit(past[i]);
+        for (unsigned i=0;i<future.length();i++) valid=valid && isDigit(future[i]);
+        settings.calendar_id=id.length() ? id : String("primary");
+        settings.past_days=past.toInt(); settings.future_days=future.toInt();
+        page.line(valid && ircalendar_store_settings(settings) ? "Saved." :
+            "Could not save. Use 0-3650 past days and 1-3650 future days. A linked calendar cannot be changed.");
+        settings=ircalendar_settings();
+    }
+    const IrMailSettings &google=irmail_settings();
+    if (!google.google()) page.line("Sign in with Google first.");
+    else if (!google.google_scope(GOOGLE_CALENDAR_SCOPE)) page.line("Sign in again to allow Calendar access.");
+    else page.line("Using the Google sign-in for "+google.address+".");
+    page.line(ircalendar_ready() ? "Calendar sync: on. Disconnect Network, then tap HotSync with no desktop waiting." : "Calendar sync: off.");
+    page.line("Syncs Date Book appointments, notes, alarms and supported repeating events. Private and archived appointments stay on the Palm.");
+    page.line("Times use the Google calendar's time zone. Use primary or the calendar ID from Google Calendar settings.");
+    const Page::Field fields[]={{"c","Calendar ID",settings.calendar_id},{"p","Days before today",String(settings.past_days)},
+                               {"f","Days after today",String(settings.future_days)}};
+    page.form("/calendarsave",fields,3,"Save",true);
+    page.link(settings.enabled ? "/calendaron/0" : "/calendaron/1",settings.enabled ? "Turn Calendar off" : "Turn Calendar on");
+    page.link("/calendarcheck","Check Calendar access");
+    page.link("/calendargoogle","Sign in with Google (from a PC)");
+    page.link(settings.cyrillic ? "/calendartext/0" : "/calendartext/1",
+        settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    String last=ircalendar_last_result();
+    if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_hotsync(bool save=false) {
+    Page page("HotSync Settings"); auto settings=irhotsync_settings();
+    if (save) {
+        settings.username=request_arg("u"); settings.username.trim(); String problem;
+        page.line(irhotsync_store_settings(settings,problem) ? "Saved. The name will be applied at the next standalone HotSync if the Palm has no name." : problem);
+        settings=irhotsync_settings();
+    }
+    page.line("One HotSync user name for Memo Pad, Note Pad, Expenses and Drive backup. Enter the name here, disconnect Network, then tap HotSync with no desktop waiting.");
+    page.line("An existing Palm name is used as-is. The Palm's numeric user identity and existing sync links are preserved. Use the original name when recovering existing backups.");
+    const Page::Field fields[]={{"u","HotSync user name (for an unnamed Palm)",settings.username}};
+    page.form("/hotsyncsave",fields,1,"Save",true);
+    page.line("Up to 40 Palm characters. Leave empty to keep automatic setup off.");
+    page.link(settings.cyrillic ? "/hotsynctext/0" : "/hotsynctext/1",settings.cyrillic ? "Name text: Cyrillic. Switch to Western" : "Name text: Western. Switch to Cyrillic");
+    String last=irhotsync_last_result(); if (last.length()) page.line("Last HotSync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_notes(bool drawing) {
+    Page page(drawing ? "Note Pad / Google Drive" : "Memo Pad / Google Docs");
+    const auto &settings=irnotes_settings(drawing);
+    String base=drawing ? "/notes" : "/memos";
+    page.line(irnotes_ready(drawing) ? "Sync is on. Disconnect Network, then tap HotSync with no desktop waiting." : "Sync is off. Allow the required Google permissions, then enable it.");
+    page.line("Folder: "+irnotes_folder(drawing));
+    page.link("/hotsync","HotSync user settings");
+    page.line(drawing ? "Two-way sync of standard Palm OS 4 Note Pad drawings and PNG files. Titles are file names. Scrolling canvases are supported. PNG imports up to 160 pixels wide are converted to black and white; Palm alarms and categories stay on Palm." :
+        "Two-way sync of classic Memo Pad text and Google Docs. One document per memo; the full memo is its body. Private and archived records are excluded.");
+    page.line("Deleting a linked note on either side deletes its counterpart. Google files are moved to Trash. Moving a file out of this folder pauses its sync.");
+    page.link(base+"on/"+(settings.enabled ? "0" : "1"),settings.enabled ? "Turn sync off" : "Turn sync on");
+    page.link(base+"check","Check Google access");
+    page.link(base+"google","Sign in with Google (from a PC)");
+    page.link(base+"text/"+(settings.cyrillic ? "0" : "1"),settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    const char *policies[]={"Stop for review","Prefer Palm edits","Prefer Google edits"};
+    page.line(String("Conflicts: ")+policies[settings.conflicts<=2 ? settings.conflicts : 0]);
+    for (unsigned i=0;i<3;i++) if (i!=settings.conflicts) page.link(base+"conflict/"+String(i),policies[i]);
+    if (!drawing) {
+        page.line("If a Google document creation is unconfirmed, check for it in Drive and retry HotSync first. An explicit retry before Google finishes propagating can create a duplicate.");
+        page.link(base+"retry","Retry unconfirmed creations");
+    }
+    String last=irnotes_last_result(drawing); if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_expenses() {
+    Page page("Expenses / Google Sheets"); const auto &s=irexpenses_settings();
+    page.line(irexpenses_ready() ? "Sync is on. Disconnect Network, then tap HotSync with no desktop waiting." : "Sync is off. Allow Drive and Sheets access, then enable it.");
+    page.line("Two-way sync of classic Palm Expense records, including date, type, payment, currency, amount, vendor, city, attendees, note and category.");
+    page.line("First HotSync creates Palm/<HotSync user name>/Expenses in Google Drive. Open the spreadsheet from a PC to edit or add expenses.");
+    String url=irexpenses_sheet_url(); if (url.length()) page.link_new_window(url,"Open Expenses spreadsheet (from a PC)");
+    page.link("/hotsync","HotSync user settings");
+    page.line("Leave Record ID empty for new rows; keep linked IDs and headers unchanged. Use YYYY-MM-DD dates and plain-text amounts. Use currencies such as NZD ($), USD ($) or EUR; existing Palm currency codes are also accepted. Category is its 0-15 slot.");
+    page.line("Set Deleted to TRUE to remove an expense from Palm; deleting on Palm marks its linked row TRUE. Keep other expense cells as plain text. Private and archived Palm records are excluded.");
+    page.line("Finish editing the spreadsheet before HotSync. Stop for review is the default when the same field changes on both sides.");
+    page.link(s.enabled ? "/expenseson/0" : "/expenseson/1",s.enabled ? "Turn Expenses off" : "Turn Expenses on");
+    page.link("/expensescheck","Check Google access"); page.link("/expensesgoogle","Sign in with Google (from a PC)");
+    page.link(s.cyrillic ? "/expensestext/0" : "/expensestext/1",s.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    const char *policies[]={"Stop for review","Prefer Palm edits","Prefer Google edits"};
+    page.line(String("Conflicts: ")+policies[s.conflicts<=2 ? s.conflicts : 0]);
+    for (unsigned i=0;i<3;i++) if (i!=s.conflicts) page.link("/expensesconflict/"+String(i),policies[i]);
+    page.line("If a creation is unconfirmed, check Drive and the spreadsheet, then retry HotSync first. Explicit retry can duplicate an operation Google has not yet made visible.");
+    page.link("/expensesretry","Retry unconfirmed creations");
+    String last=irexpenses_last_result(); if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_drive() {
+    Page page("Google Drive Backup");
+    auto settings=irdrive_settings();
+    const auto &google=irmail_settings();
+    if (!google.google_scope(GOOGLE_DRIVE_SCOPE)) page.line("Sign in with Google and allow Drive access first.");
+    page.line("Folder: "+irdrive_folder());
+    page.line(irdrive_ready() ? "Drive backup: on. Disconnect Network, then tap HotSync with no desktop waiting." : "Drive backup: off.");
+    page.line("Backs up all RAM databases and applications as PDB/PRC files, including private records and preferences. ROM and expansion cards are excluded.");
+    page.line("Newest wins: a newer Drive file installs/replaces its Palm database; newer Palm data updates Drive. Equal times keep the Palm copy. Replaced Palm data is saved in Recovery first.");
+    page.link(settings.enabled ? "/driveon/0" : "/driveon/1",settings.enabled ? "Turn Drive backup off" : "Turn Drive backup on");
+    page.link("/drivecheck","Check Drive access");
+    page.link("/drivegoogle","Sign in with Google (from a PC)");
+    page.line(settings.restore_saved ? "Saved backups will restore missing databases at the next HotSync." : "To recover missing databases from existing backups, request a one-time restore.");
+    page.link("/driverestore","Restore saved backups once");
+    String interrupted=irdrive_interrupted_name();
+    if (interrupted.length()) {
+        page.line("Interrupted installation: "+interrupted+". Retry removes this incomplete Palm database and reinstalls it from Drive.");
+        page.link("/driveretry","Retry interrupted install");
+    }
+    page.line("The Palm HotSync user name selects the folder. Set a name for an unnamed Palm in the shared HotSync settings.");
+    page.link("/hotsync","HotSync user settings");
+    page.link(settings.cyrillic ? "/drivetext/0" : "/drivetext/1",settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    String last=irdrive_last_result(); if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
+static void handle_contacts() {
+    Page page("Address Book / Google Contacts");
+    auto settings=ircontacts_settings(); const auto &google=irmail_settings();
+    if (!google.google()) page.line("Sign in with Google first.");
+    else if (!google.google_scope(GOOGLE_CONTACTS_SCOPE)) page.line("Sign in again to allow Contacts access.");
+    else if (!google.google_scope(GOOGLE_PROFILE_SCOPE)) page.line("Sign in again and allow basic profile access to identify the Contacts account.");
+    else page.line("Using the Google sign-in for "+google.address+".");
+    page.line(ircontacts_ready() ? "Contacts sync: on. Disconnect Network, then tap HotSync with no desktop waiting." : "Contacts sync: off.");
+    page.line("Syncs names, company/title, phones, email, address, notes and four Palm custom fields. Private and archived contacts stay on the Palm.");
+    page.line("Up to five phone/email values fit on the Palm; other Google values are preserved. Custom fields use Palm Custom 1 through 4 on Google.");
+    page.link(settings.enabled ? "/contactson/0" : "/contactson/1",settings.enabled ? "Turn Contacts off" : "Turn Contacts on");
+    page.link("/contactscheck","Check Contacts access");
+    page.link("/contactsgoogle","Sign in with Google (from a PC)");
+    page.link(settings.cyrillic ? "/contactstext/0" : "/contactstext/1",
+        settings.cyrillic ? "Text: Cyrillic. Switch to Western" : "Text: Western. Switch to Cyrillic");
+    if (ircontacts_has_pending()) {
+        page.line("An unconfirmed creation is waiting. Google may take several minutes to show a new contact. Sync again first; retry only if it was never created. Retrying can duplicate it.");
+        page.link("/contactsretry","Retry unconfirmed creations");
+    }
+    String last=ircontacts_last_result(); if (last.length()) page.line("Last sync: "+last);
+    page.link("/","Back"); page.send();
+}
+
 static void handle_mail() {
     Page page("Mail");
     const IrMailSettings &mail = irmail_settings();
@@ -911,7 +1239,7 @@ static void handle_mail() {
     }
     page.link("/mailacct", mail.address.length() == 0 ? "Enter the account (with a password)" : "Change the account");
 
-    if (irmail_ready()) {
+    if (irmail_enabled()) {
         page.line("Mail sync: on. Tap HotSync on the Palm while no desktop program is waiting for it: "
                   "the Outbox is sent and new messages arrive in the Inbox.");
         page.link("/mailon/0", "Turn mail sync off");
@@ -1029,7 +1357,13 @@ static void handle_mail_test() {
 
 // The Palm cannot show Google's sign-in page: open the sign-in pages to a PC on
 // the same Wi-Fi for a while, and say where to find them
-static void handle_mail_google() {
+static void handle_mail_google(bool tasks = false, bool calendar = false, bool contacts = false, bool drive = false, int notes = -1, bool expenses = false) {
+    s_google_from_tasks = tasks;
+    s_google_from_calendar = calendar;
+    s_google_from_contacts = contacts;
+    s_google_from_drive = drive;
+    s_google_from_notes = notes;
+    s_google_from_expenses = expenses;
     Page page("Sign in with Google");
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -1040,9 +1374,9 @@ static void handle_mail_google() {
         page.line("On a PC on the same Wi-Fi (" + WiFi.SSID() + "), open within " +
                   String((unsigned)(GOOGLE_SETUP_WINDOW_MS / 60000)) + " minutes:");
         page.line("http://" + WiFi.localIP().toString() + "/google");
-        page.line("You need your own Google OAuth client (client ID and secret): see the README, Mail, Sign in with Google.");
+        page.line("You need your own Google OAuth client (client ID and secret): see docs/google/README.md in the project.");
     }
-    page.link("/mail", "Back");
+    page.link(expenses ? "/expenses" : notes>=0 ? (notes ? "/notes" : "/memos") : drive ? "/drive" : contacts ? "/contacts" : calendar ? "/calendar" : tasks ? "/tasks" : "/mail", "Back");
     page.send();
 }
 
@@ -1060,27 +1394,31 @@ static void handle_mail_google_off() {
 // ------------------------------------------------------------------------------
 
 static void pc_google_form(Page &page, const String &address, const String &client_id) {
-    const Page::Field fields[] = {{"a", "Gmail address", address},
+    const Page::Field fields[] = {{"a", "Google account address", address},
                                   {"i", "Client ID", client_id},
                                   {"s", "Client secret", ""}};
     page.form("/googlestart", fields, 3, "Continue", true);
 }
 
 static void handle_pc_google() {
-    Page page("Gmail: Sign in with Google");
+    Page page("Sign in with Google");
     const IrMailSettings &mail = irmail_settings();
 
     if (mail.google()) {
         page.line("Signed in as " + mail.address + ". Signing in again replaces that.");
     }
     page.line("1. In the Google Cloud console, create an OAuth client of type \"Desktop app\" "
-              "(the README, Mail, Sign in with Google, has the steps), and enter it here:");
+              "(docs/google/README.md in the project has the steps), and enter it here:");
+    page.line("This sign-in requests Mail, Tasks, Contacts, Calendar, Drive, Docs, Sheets and Slides access together.");
+    page.line("Basic profile access identifies the Google account for Contacts sync.");
+    page.line("Drive backs up Palm databases and Note Pad drawings; Docs syncs Memo Pad text; Sheets syncs Expenses. Slides permission is prepared for future features.");
+    page.line("Leave the client secret blank to keep the stored secret for this client ID.");
     pc_google_form(page, mail.address, mail.google_client_id);
     page.send();
 }
 
 static void handle_pc_google_start() {
-    Page page("Gmail: Sign in with Google");
+    Page page("Sign in with Google");
 
     String address = request_arg("a");
     String client_id = request_arg("i");
@@ -1088,8 +1426,10 @@ static void handle_pc_google_start() {
     address.trim();
     client_id.trim();
     client_secret.trim();
+    const IrMailSettings &stored = irmail_settings();
+    if (client_secret.length() == 0 && client_id == stored.google_client_id) client_secret = stored.google_client_secret;
     if (address.indexOf('@') < 1 || address.indexOf(' ') >= 0 || client_id.length() == 0 || client_secret.length() == 0) {
-        page.line("Enter the Gmail address, the client ID and the client secret.");
+        page.line("Enter the Google account address, the client ID and the client secret.");
         pc_google_form(page, address, client_id);
         page.send();
         return;
@@ -1107,8 +1447,9 @@ static void handle_pc_google_start() {
 }
 
 static void handle_pc_google_done() {
-    Page page("Gmail: Sign in with Google");
+    Page page("Sign in with Google");
 
+    bool mail_was_enabled = irmail_settings().enabled;
     String message;
     if (!irmail_google_finish(request_arg("u"), message)) {
         page.line(message);
@@ -1116,12 +1457,65 @@ static void handle_pc_google_done() {
         page.send();
         return;
     }
-    page.line(message);
-    String receiving, sending;
-    irmail_check_login(receiving, sending);
-    page.line("Receiving: " + receiving);
-    page.line("Sending: " + sending);
-    page.line("You can close this page. Tap HotSync on the Palm to sync mail.");
+    if (s_google_from_expenses) {
+        IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
+        auto expenses=irexpenses_settings(); expenses.enabled=mail.google_scope(GOOGLE_DRIVE_SCOPE) && mail.google_scope(GOOGLE_SHEETS_SCOPE);
+        if (!expenses.enabled) page.line("Google did not grant Drive and Sheets access. Sign in again and allow both.");
+        else page.line(irexpenses_store_settings(expenses) ? "Expenses sync is on." : "Could not enable Expenses sync.");
+        page.line(irexpenses_check_login());
+    } else if (s_google_from_notes>=0) {
+        IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
+        bool drawing=s_google_from_notes==1;
+        auto notes=irnotes_settings(drawing); notes.enabled=mail.google_scope(GOOGLE_DRIVE_SCOPE) && (drawing || mail.google_scope(GOOGLE_DOCS_SCOPE));
+        if (!notes.enabled) page.line("Google did not grant the required Drive/Docs permissions. Sign in again and allow them.");
+        else page.line(irnotes_store_settings(drawing,notes) ? "Notes sync is on." : "Could not enable notes sync.");
+        page.line(irnotes_check_login(drawing));
+    } else if (s_google_from_drive) {
+        IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
+        auto drive=irdrive_settings(); drive.enabled=mail.google_scope(GOOGLE_DRIVE_SCOPE);
+        if (!drive.enabled) page.line("Google did not grant Drive access. Sign in again and allow Drive.");
+        else page.line(irdrive_store_settings(drive) ? "Drive backup is on." : "Could not enable Drive backup. Enable it from the Palm's Drive page.");
+        page.line(irdrive_check_login());
+    } else if (s_google_from_contacts) {
+        IrMailSettings mail=irmail_settings(); mail.enabled=mail_was_enabled; irmail_store_settings(mail);
+        auto contacts=ircontacts_settings(); contacts.enabled=mail.google_contacts();
+        if (!contacts.enabled) page.line("Google did not grant both Contacts and basic profile access. Sign in again and allow both.");
+        else page.line(ircontacts_store_settings(contacts) ? "Contacts sync is on." : "Could not enable Contacts. Enable it from the Palm's Contacts page.");
+        page.line(ircontacts_check_login());
+    } else if (s_google_from_calendar) {
+        IrMailSettings mail=irmail_settings();
+        mail.enabled=mail_was_enabled;
+        irmail_store_settings(mail);
+        IrCalendarSettings calendar=ircalendar_settings();
+        calendar.enabled=mail.google_scope(GOOGLE_CALENDAR_SCOPE);
+        if (!calendar.enabled) page.line("Google did not grant Calendar access. Sign in again and allow Calendar.");
+        else page.line(ircalendar_store_settings(calendar) ? "Calendar sync is on." : "Could not enable Calendar. Enable it from the Palm's Calendar page.");
+        page.line(ircalendar_check_login());
+    } else if (s_google_from_tasks) {
+        IrMailSettings mail = irmail_settings();
+        mail.enabled = mail_was_enabled;
+        irmail_store_settings(mail);
+        IrTasksSettings tasks = irtasks_settings();
+        tasks.enabled = mail.google_tasks();
+        if (!tasks.enabled) page.line("Google did not grant Tasks access. Sign in again and allow Tasks.");
+        else page.line(irtasks_store_settings(tasks) ? "Google Tasks sync is on." : "Could not enable Tasks. Enable it from the Palm's Tasks page.");
+        page.line(irtasks_check_login());
+    } else {
+        page.line(message);
+        String receiving, sending;
+        irmail_check_login(receiving, sending);
+        page.line("Receiving: " + receiving);
+        page.line("Sending: " + sending);
+    }
+    const IrMailSettings &google = irmail_settings();
+    const char *names[] = {"Mail", "Tasks", "Contacts", "Calendar", "Drive", "Docs", "Sheets", "Slides", "Basic profile"};
+    const char *scopes[] = {GOOGLE_MAIL_SCOPE, GOOGLE_TASKS_SCOPE, GOOGLE_CONTACTS_SCOPE, GOOGLE_CALENDAR_SCOPE,
+                            GOOGLE_DRIVE_SCOPE, GOOGLE_DOCS_SCOPE, GOOGLE_SHEETS_SCOPE, GOOGLE_SLIDES_SCOPE, GOOGLE_PROFILE_SCOPE};
+    static_assert(sizeof(names) / sizeof(names[0]) == sizeof(scopes) / sizeof(scopes[0]), "Google permission names and scopes must match");
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        page.line(String(names[i]) + " access: " + (google.google_scope(scopes[i]) ? "granted" : "not granted"));
+    }
+    page.line("You can close this page. Tap HotSync on the Palm to run the enabled conduits.");
     s_google_window_open = false; // Done: the Wi-Fi side is shut out again
     page.send();
 }
@@ -1154,8 +1548,7 @@ static bool serve_pc_request() {
 // the page over Wi-Fi (following redirects onto HTTPS), strips what the Palm
 // cannot use, and passes the HTML on.
 //
-// The same code serves Xiino's "DataServer" mode, where the browser sends every
-// request to one server as GET /<display settings>/?<real address>.
+// Xiino's DataServer requests are handled separately by the OpenXiino port.
 
 struct ProxyUrl {
     bool https;
@@ -1633,6 +2026,27 @@ static void route_request() {
         site = site.substring(0, port);
     }
     site.toLowerCase();
+    if (site.length()>0 && site!=PORTAL_DOMAIN && site!=PPP_GATEWAY_IP) {
+        if (s_xiino_request.dataserver) ++s_dataserver_pages; else ++s_direct_pages;
+    }
+    if (s_xiino_request.dataserver && site != PORTAL_DOMAIN && site != PPP_GATEWAY_IP) {
+        if (s_request_method != "GET") {
+            respond("501 Not Implemented", "text/html", "<HTML><BODY>Unsupported method</BODY></HTML>");
+        } else if (WiFi.status() == WL_CONNECTED || !xiino_builtin(s_xiino_request, "").empty()) {
+            std::string problem;
+            bool started=false;
+            bool ok=irxiino_stream(s_xiino_request,s_request_text.c_str(),[&]() {
+                started=true;
+                return send_all("HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n") &&
+                    send_bytes(xiino_padding().data(),xiino_padding().size());
+            },send_bytes,problem);
+            if (!ok && !started) proxy_error(s_target,String(problem.c_str()));
+        } else {
+            s_request_host = site;
+            handle_other_site();
+        }
+        return;
+    }
     if (site.length() > 0 && site != PORTAL_DOMAIN && site != PPP_GATEWAY_IP && site != XIINO_DATASERVER_HOST) {
         if (WiFi.status() == WL_CONNECTED) {
             proxy_fetch(scheme >= 0 ? s_target : "http://" + s_request_host + s_target);
@@ -1678,12 +2092,109 @@ static void route_request() {
         store_settings();
         handle_status();
     }
+    else if (path=="/hotsync" && !indexed) handle_hotsync();
+    else if ((path=="/hotsyncsave" || path=="/drivesave") && !indexed) handle_hotsync(true);
+    else if (path=="/hotsynctext" && indexed && index>=0 && index<=1) {
+        auto settings=irhotsync_settings(); settings.cyrillic=index==1; String problem;
+        if (!irhotsync_store_settings(settings,problem)) { Page page("HotSync Settings"); page.line(problem); page.link("/hotsync","Back"); page.send(); }
+        else handle_hotsync();
+    }
+    else if (path=="/expenses" && !indexed) handle_expenses();
+    else if (path=="/expensescheck" && !indexed) {
+        Page page("Expenses Access"); page.line(irexpenses_check_login()); page.link("/expenses","Back"); page.send();
+    }
+    else if (path=="/expensesgoogle" && !indexed) handle_mail_google(false,false,false,false,-1,true);
+    else if (path=="/expensesretry" && !indexed) {
+        Page page("Expense Retry"); page.line(irexpenses_retry_creations() ? "Currently unconfirmed creations will be checked and retried at the next HotSync." : "No unconfirmed creations are pending, or state could not be saved."); page.link("/expenses","Back"); page.send();
+    }
+    else if ((path=="/expenseson" || path=="/expensestext" || path=="/expensesconflict") && indexed && index>=0 && index<=2) {
+        auto settings=irexpenses_settings(); bool valid=true;
+        if (path=="/expensesconflict") settings.conflicts=index;
+        else if (index>1) valid=false;
+        else if (path=="/expenseson") settings.enabled=index==1;
+        else settings.cyrillic=index==1;
+        if (!valid || !irexpenses_store_settings(settings)) { Page page("Expense Settings"); page.line("Could not save Expense settings."); page.link("/expenses","Back"); page.send(); }
+        else handle_expenses();
+    }
+    else if ((path=="/memos" || path=="/notes") && !indexed) handle_notes(path=="/notes");
+    else if ((path=="/memoscheck" || path=="/notescheck") && !indexed) {
+        bool drawing=path=="/notescheck"; Page page("Notes Access"); page.line(irnotes_check_login(drawing)); page.link(drawing ? "/notes" : "/memos","Back"); page.send();
+    }
+    else if ((path=="/memosgoogle" || path=="/notesgoogle") && !indexed) handle_mail_google(false,false,false,false,path=="/notesgoogle" ? 1 : 0);
+    else if (path=="/memosretry" && !indexed) {
+        Page page("Memo Retry"); page.line(irnotes_retry_creations(false) ? "Currently unconfirmed creations will be checked and retried at the next HotSync." : "No unconfirmed creations are pending, or sync state could not be saved."); page.link("/memos","Back"); page.send();
+    }
+    else if ((path=="/memoson" || path=="/noteson" || path=="/memostext" || path=="/notestext" || path=="/memosconflict" || path=="/notesconflict") && indexed && index>=0 && index<=2) {
+        bool drawing=path.startsWith("/notes"); auto settings=irnotes_settings(drawing);
+        bool valid=true;
+        if (path.endsWith("conflict")) settings.conflicts=index;
+        else if (index>1) valid=false;
+        else if (path.endsWith("on")) settings.enabled=index==1;
+        else settings.cyrillic=index==1;
+        if (!valid || !irnotes_store_settings(drawing,settings)) { Page page("Notes Settings"); page.line("Could not save notes settings."); page.link(drawing ? "/notes" : "/memos","Back"); page.send(); }
+        else handle_notes(drawing);
+    }
+    else if (path == "/drive" && !indexed) handle_drive();
+    else if (path == "/drivecheck" && !indexed) {
+        Page page("Drive Access"); page.line(irdrive_check_login()); page.link("/drive","Back"); page.send();
+    }
+    else if (path == "/drivegoogle" && !indexed) handle_mail_google(false,false,false,true);
+    else if (path == "/driverestore" && !indexed) {
+        Page page("Drive Restore"); page.line(irdrive_restore_once() ? "Missing databases from saved backups will restore at the next HotSync." : "Could not save the restore request.");
+        page.link("/drive","Back"); page.send();
+    }
+    else if (path == "/driveretry" && !indexed) {
+        Page page("Drive Retry"); page.line(irdrive_retry_interrupted() ? "The interrupted install will retry at the next HotSync." : "No interrupted install is pending, or the request could not be saved.");
+        page.link("/drive","Back"); page.send();
+    }
+    else if ((path == "/driveon" || path == "/drivetext") && indexed && index>=0 && index<=1) {
+        auto settings=irdrive_settings();
+        if (path=="/driveon") settings.enabled=index==1; else settings.cyrillic=index==1;
+        if (!irdrive_store_settings(settings)) { Page page("Drive Settings"); page.line("Could not save Drive settings."); page.link("/drive","Back"); page.send(); }
+        else handle_drive();
+    }
+    else if (path == "/contacts" && !indexed) handle_contacts();
+    else if (path == "/contactscheck" && !indexed) {
+        Page page("Contacts Access"); page.line(ircontacts_check_login()); page.link("/contacts","Back"); page.send();
+    }
+    else if (path == "/contactsgoogle" && !indexed) handle_mail_google(false,false,true);
+    else if (path == "/contactsretry" && !indexed) {
+        Page page("Contacts Retry"); page.line(ircontacts_retry_pending() ? "Pending creations will be checked and retried at the next sync." : "Could not save Contacts state.");
+        page.link("/contacts","Back"); page.send();
+    }
+    else if ((path == "/contactson" || path == "/contactstext") && indexed && index>=0 && index<=1) {
+        auto settings=ircontacts_settings();
+        if (path=="/contactson") settings.enabled=index==1; else settings.cyrillic=index==1;
+        ircontacts_store_settings(settings); handle_contacts();
+    }
+    else if (path == "/calendar" && !indexed) handle_calendar();
+    else if (path == "/calendarsave" && !indexed) handle_calendar(true);
+    else if (path == "/calendarcheck" && !indexed) {
+        Page page("Calendar Access"); page.line(ircalendar_check_login()); page.link("/calendar","Back"); page.send();
+    }
+    else if (path == "/calendargoogle") handle_mail_google(false,true);
+    else if ((path == "/calendaron" || path == "/calendartext") && indexed && index>=0 && index<=1) {
+        IrCalendarSettings settings=ircalendar_settings();
+        if (path=="/calendaron") settings.enabled=index==1; else settings.cyrillic=index==1;
+        ircalendar_store_settings(settings); handle_calendar();
+    }
+    else if (path == "/tasks" && !indexed) handle_tasks();
+    else if (path == "/taskssave" && !indexed) handle_tasks(true);
+    else if (path == "/taskstest" && !indexed) {
+        Page page("Google Tasks Access"); page.line(irtasks_check_login()); page.link("/tasks", "Back"); page.send();
+    }
+    else if ((path == "/taskson" || path == "/taskstext") && indexed && index >= 0 && index <= 1) {
+        IrTasksSettings settings = irtasks_settings();
+        if (path == "/taskson") settings.enabled = index == 1; else settings.cyrillic = index == 1;
+        irtasks_store_settings(settings); handle_tasks();
+    }
     else if (path == "/mail" && !indexed) handle_mail();
     else if (path == "/mailacct") handle_mail_account();
     else if (path == "/mailsave") handle_mail_account_save();
     else if (path == "/mailsrv") handle_mail_servers(false);
     else if (path == "/mailsrvsave") handle_mail_servers(true);
     else if (path == "/mailtest") handle_mail_test();
+    else if (path == "/tasksgoogle") handle_mail_google(true);
     else if (path == "/mailgoogle") handle_mail_google();
     else if (path == "/mailgoogleoff") handle_mail_google_off();
     else if ((path == "/mailon" || path == "/mailtext") && indexed && index >= 0 && index <= 1) {
@@ -1718,6 +2229,7 @@ static String header_value(const String &request_lower, const char *name) {
 }
 
 static void serve_client() {
+    s_xiino_request = XiinoRequest();
     // Read until the blank line that ends the headers. Old clients may use bare
     // line feeds, send no headers at all (HTTP/0.9), or close their side early.
     static char raw[HTTP_REQUEST_MAX + 1];
@@ -1773,7 +2285,10 @@ static void serve_client() {
     int line_end = request.indexOf('\n');
     String line = (line_end >= 0) ? request.substring(0, line_end) : request;
     line.trim();
-    irdbg_printf("HTTP from %s: %s", IPAddress(s_client_ip).toString().c_str(), line.c_str());
+    bool task_credentials = line.indexOf("/googlestart") >= 0 || line.indexOf("/googledone") >= 0;
+    irdbg_printf("HTTP from %s: %s", IPAddress(s_client_ip).toString().c_str(),
+                 task_credentials ? "Google sign-in credentials (redacted)" : line.c_str());
+    if (task_credentials) s_request_text = "Google sign-in credentials (redacted)";
 
     int first_space = line.indexOf(' ');
     if (first_space < 0) {
@@ -1786,15 +2301,10 @@ static void serve_client() {
     int second_space = line.indexOf(' ', first_space + 1);
     s_target = (second_space >= 0) ? line.substring(first_space + 1, second_space) : line.substring(first_space + 1);
 
-    // Xiino asks its DataServer for "/<display settings>/?<real address>":
-    // the real address is what counts
-    int real = s_target.indexOf("?http://");
-    if (real < 0) {
-        real = s_target.indexOf("?https://");
-    }
-    if (real >= 0) {
-        s_target = s_target.substring(real + 1);
-    }
+    // Preserve DataServer settings and response framing; local portal pages
+    // still route normally after extracting their real address.
+    s_xiino_request = xiino_request(s_target.c_str());
+    if (s_xiino_request.dataserver) s_target = s_xiino_request.url.c_str();
 
     // Form fields: after the "?" of the address, and / or in the body
     int query = s_target.indexOf('?');
@@ -1823,7 +2333,7 @@ static void serve_client() {
 #if ENABLE_CDC_DEBUG
     // Every header the browser sent, one trace line each
     int from = (line_end >= 0) ? line_end + 1 : (int)request.length();
-    while (from < (int)request.length()) {
+    while (!task_credentials && from < (int)request.length()) {
         int to = request.indexOf('\n', from);
         String header = (to >= 0) ? request.substring(from, to) : request.substring(from);
         header.trim();
@@ -1837,15 +2347,18 @@ static void serve_client() {
     }
 #endif
 
-    // The portal is for the Palm only: refuse anything arriving from the Wi-Fi
-    // side, but for the Google sign-in pages while the Palm has them open
+    // Only the temporary Google sign-in pages are reachable from Wi-Fi.
     if (s_client_ip == 0 || s_client_ip != irppp_palm_ip()) {
-        if (!serve_pc_request()) {
-            respond("403 Forbidden", "text/plain", "Forbidden\r\n");
-        }
-        return;
+        if (!serve_pc_request()) respond("403 Forbidden", "text/plain", "Forbidden\r\n");
+    } else {
+        route_request();
     }
-    route_request();
+    if (task_credentials) {
+        s_request_body = "";
+        s_params = "";
+        s_target = "/google";
+        memset(raw, 0, len);
+    }
 }
 
 static void http_task(void *arg) {
@@ -1855,8 +2368,16 @@ static void http_task(void *arg) {
     local.sin_port = htons(80);
     local.sin_addr.s_addr = htonl(INADDR_ANY);
     if (listener < 0 || bind(listener, (struct sockaddr *)&local, sizeof(local)) < 0 || listen(listener, 2) < 0) {
+        if (listener >= 0) close(listener);
         vTaskDelete(NULL);
         return;
+    }
+    int xiino_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    local.sin_port = htons(XIINO_DATASERVER_PORT);
+    if (xiino_listener < 0 || bind(xiino_listener, (struct sockaddr *)&local, sizeof(local)) < 0 || listen(xiino_listener, 2) < 0) {
+        if (xiino_listener >= 0) close(xiino_listener);
+        xiino_listener = -1;
+        irdbg_printf("Xiino: could not listen on port %u", XIINO_DATASERVER_PORT);
     }
 
     for (;;) {
@@ -1866,14 +2387,16 @@ static void http_task(void *arg) {
         fd_set readable;
         FD_ZERO(&readable);
         FD_SET(listener, &readable);
+        if (xiino_listener >= 0) FD_SET(xiino_listener, &readable);
         struct timeval wait = {0, 200 * 1000};
-        if (select(listener + 1, &readable, NULL, NULL, &wait) <= 0) {
+        if (select((xiino_listener > listener ? xiino_listener : listener) + 1, &readable, NULL, NULL, &wait) <= 0) {
             continue;
         }
 
         struct sockaddr_in peer = {};
         socklen_t peer_len = sizeof(peer);
-        s_client = accept(listener, (struct sockaddr *)&peer, &peer_len);
+        int ready_listener = FD_ISSET(listener, &readable) ? listener : xiino_listener;
+        s_client = accept(ready_listener, (struct sockaddr *)&peer, &peer_len);
         if (s_client < 0) {
             continue;
         }
@@ -1881,6 +2404,8 @@ static void http_task(void *arg) {
 
         struct timeval timeout = {HTTP_READ_TIMEOUT_S, 0};
         setsockopt(s_client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        struct timeval send_timeout = {PROXY_TIMEOUT_MS / 1000, (PROXY_TIMEOUT_MS % 1000) * 1000};
+        setsockopt(s_client, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
         serve_client();
 
         // Finish our side, then wait for the client to close. Closing with unread
@@ -2037,11 +2562,13 @@ static void dns_task(void *arg) {
                     pkt[2] |= DNS_FLAG_RESPONSE;
                     pkt[3] = 0x80 | DNS_RCODE_SERVFAIL;
                     sendto(sock, pkt, len, 0, (struct sockaddr *)&from, from_len);
-                } else if (strcmp(name, PORTAL_DOMAIN) == 0 || strcmp(name, XIINO_DATASERVER_HOST) == 0 || !wifi_up ||
+                } else if (strcmp(name, PORTAL_DOMAIN) == 0 || strcmp(name, XIINO_DATASERVER_HOST) == 0 ||
+                           strcmp(name, XIINO_DATASERVER_LEGACY_HOST) == 0 || !wifi_up ||
                            s_proxy_all_sites) {
                     // Our own names, no Wi-Fi yet, or the web proxy is on (the browser
                     // must come to us for every site): answer with the gateway address
-                    bool own = strcmp(name, PORTAL_DOMAIN) == 0 || strcmp(name, XIINO_DATASERVER_HOST) == 0;
+                    bool own = strcmp(name, PORTAL_DOMAIN) == 0 || strcmp(name, XIINO_DATASERVER_HOST) == 0 ||
+                               strcmp(name, XIINO_DATASERVER_LEGACY_HOST) == 0;
                     log_lookup(name, own ? "portal" : wifi_up ? "web proxy" : "portal (no Wi-Fi)");
                     int n = make_portal_answer(pkt, question_end, inet_addr(PPP_GATEWAY_IP));
                     sendto(sock, pkt, n, 0, (struct sockaddr *)&from, from_len);
@@ -2114,6 +2641,7 @@ static void dns_task(void *arg) {
 // ------------------------------------------------------------------------------
 
 void irportal_init() {
+    irxiino_init();
     // The connection manager in the portal task decides what to join and when
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);

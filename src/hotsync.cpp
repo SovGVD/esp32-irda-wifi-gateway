@@ -368,6 +368,12 @@ static uint8_t next_txid() {
 // Session
 // ------------------------------------------------------------------------------
 
+bool hotsync_resize_buffer(uint8_t *memory,size_t memory_size) {
+    if (!memory || memory_size<HOTSYNC_BUFFER_SIZE(0)) { s_error=HOTSYNC_ERR_TOO_LARGE; return false; }
+    s_pkt=memory; s_msg=memory+HOTSYNC_PACKET_SPACE; s_msg_size=memory_size-HOTSYNC_PACKET_SPACE;
+    return true;
+}
+
 bool hotsync_accept(const HotSync_Io *io, uint8_t *memory, size_t memory_size, uint32_t timeout_ms) {
     s_io = io;
     s_error = 0;
@@ -441,7 +447,7 @@ void hotsync_keep_alive() {
 // Sends a request whose single argument (arg_len bytes, or none if negative)
 // is already at s_msg + DLP_ARG_OFFSET, and reads the answer into s_msg.
 // On success *reply / *reply_len describe the first argument of the answer.
-static bool dlp_call(uint8_t command, int arg_len, const uint8_t **reply, size_t *reply_len) {
+static bool dlp_call(uint8_t command, int arg_len, const uint8_t **reply, size_t *reply_len, uint8_t arg_id = DLP_ARG_ID) {
     if (s_error == HOTSYNC_ERR_LINK) {
         return false;
     }
@@ -458,14 +464,14 @@ static bool dlp_call(uint8_t command, int arg_len, const uint8_t **reply, size_t
         request = s_msg + DLP_ARG_OFFSET - 4;
         request[0] = command;
         request[1] = 1;
-        request[2] = DLP_ARG_ID;
+        request[2] = arg_id;
         request[3] = (uint8_t)arg_len;
         request_len = 4 + arg_len;
     } else {
         request = s_msg;
         request[0] = command;
         request[1] = 1;
-        request[2] = DLP_ARG_ID | DLP_ARG_SHORT;
+        request[2] = arg_id | DLP_ARG_SHORT;
         request[3] = 0;
         put16(request + 4, (uint16_t)arg_len);
         request_len = 6 + arg_len;
@@ -540,6 +546,13 @@ bool hotsync_read_sys_info(uint32_t *rom_version) {
     return true;
 }
 
+bool hotsync_read_user_id(uint32_t *user_id) {
+    const uint8_t *reply; size_t len;
+    if (!dlp_call_expect(0x10, -1, 4, &reply, &len)) return false;
+    *user_id = get32(reply);
+    return true;
+}
+
 bool hotsync_get_time(HotSync_Time *time) {
     const uint8_t *reply;
     size_t len;
@@ -604,13 +617,18 @@ bool hotsync_close_db(uint8_t handle) {
 }
 
 // Answer to the calls that read a record: id (4), index (2), size (2), attributes (1), category (1), data
-static bool read_record_call(uint8_t command, int arg_len, HotSync_Record *record) {
+static bool read_record_call(uint8_t command, int arg_len, HotSync_Record *record, uint8_t arg_id = DLP_ARG_ID) {
     const uint8_t *reply;
     size_t len;
-    if (!dlp_call_expect(command, arg_len, DLP_READ_HEADER, &reply, &len)) {
+    if (!dlp_call(command, arg_len, &reply, &len, arg_id)) {
+        return false;
+    }
+    if (reply == nullptr || len < DLP_READ_HEADER) {
+        s_error = HOTSYNC_ERR_PROTOCOL;
         return false;
     }
     size_t size = get16(reply + 6);
+    record->total_len = size;
     record->id = get32(reply);
     record->attr = reply[8];
     record->category = reply[9];
@@ -643,6 +661,26 @@ bool hotsync_read_record_start(uint8_t handle, uint32_t id, size_t max_len, HotS
 bool hotsync_read_record(uint8_t handle, uint32_t id, HotSync_Record *record) {
     // No more than fits the working memory: the rest would only be dropped
     return hotsync_read_record_start(handle, id, s_msg_size - 8 - DLP_READ_HEADER, record);
+}
+
+bool hotsync_read_record_by_index(uint8_t handle, uint16_t index, HotSync_Record *record) {
+    size_t room = s_msg_size - 8 - DLP_READ_HEADER;
+    return hotsync_read_record_part(handle,index,0,(uint16_t)(room<0xFF00 ? room : 0xFF00),record);
+}
+bool hotsync_read_record_part(uint8_t handle,uint16_t index,uint16_t offset,uint16_t length,HotSync_Record *record) {
+    uint8_t *arg = s_msg + DLP_ARG_OFFSET;
+    arg[0] = handle;
+    arg[1] = 0;
+    put16(arg + 2, index);
+    put16(arg + 4, offset);
+    put16(arg + 6, length);
+    if (!read_record_call(DLP_READ_RECORD,8,record,0x21)) return false;
+    // Partial reads report the whole record size in the response header.
+    if (offset>record->total_len) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    size_t remaining=record->total_len-offset;
+    if (record->len>remaining) record->len=remaining;
+    record->truncated=remaining>record->len;
+    return true;
 }
 
 uint8_t *hotsync_record_buffer(size_t *max_len) {
@@ -706,4 +744,102 @@ bool hotsync_add_log(const char *text) {
 bool hotsync_end(uint16_t status) {
     put16(s_msg + DLP_ARG_OFFSET, status);
     return dlp_call(DLP_END_OF_SYNC, 2, nullptr, nullptr);
+}
+
+// Classic DLP 1.2 database transfers. Layouts follow the Palm desktop DLP
+// protocol used by pilot-link; dates remain in their wire calendar format.
+bool hotsync_read_user(uint32_t *id,char *name,size_t capacity) {
+    const uint8_t *p; size_t n;
+    if (!capacity || !dlp_call_expect(0x10,-1,30,&p,&n)) return false;
+    size_t length=p[28];
+    if (length>n-30 || length>=capacity) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    *id=get32(p); memcpy(name,p+30,length); name[length]=0;
+    return true;
+}
+bool hotsync_write_user(uint32_t id,const char *name) {
+    size_t length=strnlen(name,64);
+    if (length>40) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    const uint8_t *p; size_t n;
+    if (!dlp_call_expect(0x10,-1,30,&p,&n)) return false;
+    // Preserve viewer ID, last desktop and last-sync date when restoring the
+    // HotSync identity of a reset handheld. Read/WriteUserInfo date offsets differ.
+    uint8_t saved[20]; memcpy(saved,p,12); memcpy(saved+12,p+20,8);
+    bool change_id=get32(saved)!=id;
+    uint8_t *a=s_msg+DLP_ARG_OFFSET; memcpy(a,saved,20); put32(a,id);
+    // Palm SDK DLCommon.h: change name (0x10), and ID (0x80) only when
+    // requested. Never mark sync dates, desktop or viewer metadata modified.
+    a[20]=change_id ? 0x90 : 0x10; a[21]=(uint8_t)(length+1); memcpy(a+22,name,length+1);
+    return dlp_call(0x11,(int)(23+length),nullptr,nullptr);
+}
+bool hotsync_read_db_info(uint16_t start,HotSync_DBInfo *info) {
+    uint8_t *a=s_msg+DLP_ARG_OFFSET; a[0]=0x80; a[1]=0; put16(a+2,start);
+    const uint8_t *p; size_t n;
+    if (!dlp_call_expect(0x16,4,49,&p,&n)) return false;
+    if (p[3]!=1 || p[4]<45 || p[4]>n-4 || !memchr(p+48,0,p[4]-44)) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    *info=HotSync_DBInfo();
+    info->flags=get16(p+6); info->type=get32(p+8); info->creator=get32(p+12);
+    info->version=get16(p+16); info->modification=get32(p+18);
+    memcpy(info->created,p+22,8); memcpy(info->modified,p+30,8); memcpy(info->backed_up,p+38,8);
+    info->index=get16(p+46);
+    size_t length=strlen((const char *)p+48);
+    if (!length || length>31 || info->index<start) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    memcpy(info->name,p+48,length+1); return true;
+}
+bool hotsync_db_count(uint8_t handle,uint16_t *count) {
+    s_msg[DLP_ARG_OFFSET]=handle; const uint8_t *p; size_t n;
+    if (!dlp_call_expect(0x2b,1,2,&p,&n)) return false;
+    *count=get16(p); return true;
+}
+bool hotsync_create_db(const HotSync_DBInfo &i,uint8_t *handle) {
+    size_t length=strnlen(i.name,32); if (!length || length>31) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    uint8_t *a=s_msg+DLP_ARG_OFFSET;
+    put32(a,i.creator); put32(a+4,i.type); a[8]=0; a[9]=0;
+    // Read-only/open flags are restored only after all content is written.
+    put16(a+10,i.flags&~0x8002u); put16(a+12,i.version); memcpy(a+14,i.name,length+1);
+    const uint8_t *p; size_t n;
+    if (!dlp_call_expect(0x18,(int)(15+length),1,&p,&n)) return false;
+    *handle=p[0]; return true;
+}
+bool hotsync_delete_db(const char *name) {
+    size_t length=strnlen(name,32); if (!length || length>31) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    uint8_t *a=s_msg+DLP_ARG_OFFSET; a[0]=a[1]=0; memcpy(a+2,name,length+1);
+    return dlp_call(0x1a,(int)(3+length),nullptr,nullptr);
+}
+bool hotsync_set_db_info(uint8_t handle,const HotSync_DBInfo &i) {
+    uint8_t *a=s_msg+DLP_ARG_OFFSET; a[0]=handle; a[1]=0;
+    put16(a+2,0x7ffe); put16(a+4,i.flags&~0x8000u); put16(a+6,i.version);
+    memcpy(a+8,i.created,8); memcpy(a+16,i.modified,8); memcpy(a+24,i.backed_up,8);
+    put32(a+32,i.type); put32(a+36,i.creator);
+    return dlp_call(0x3a,40,nullptr,nullptr);
+}
+bool hotsync_read_db_block(uint8_t handle,bool sort,uint16_t offset,uint16_t length,const uint8_t **data,size_t *size) {
+    uint8_t *a=s_msg+DLP_ARG_OFFSET; a[0]=handle; a[1]=0; put16(a+2,offset); put16(a+4,length);
+    const uint8_t *p; size_t n;
+    if (!dlp_call_expect(sort ? 0x1d : 0x1b,6,2,&p,&n)) return false;
+    *data=p+2; *size=n-2;
+    if (*size>length) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    return true;
+}
+bool hotsync_write_db_block(uint8_t handle,bool sort,const uint8_t *data,size_t size) {
+    if (size>65489 || size+10>s_msg_size) { s_error=HOTSYNC_ERR_TOO_LARGE; return false; }
+    uint8_t *a=s_msg+DLP_ARG_OFFSET;
+    // memmove permits callers to use the shared record buffer.
+    memmove(a+4,data,size); a[0]=handle; a[1]=0; put16(a+2,(uint16_t)size);
+    return dlp_call(sort ? 0x1e : 0x1c,(int)(4+size),nullptr,nullptr);
+}
+bool hotsync_read_resource(uint8_t handle,uint16_t index,uint16_t offset,uint16_t length,HotSync_Resource *r) {
+    uint8_t *a=s_msg+DLP_ARG_OFFSET; a[0]=handle; a[1]=0;
+    put16(a+2,index); put16(a+4,offset); put16(a+6,length);
+    const uint8_t *p; size_t n;
+    if (!dlp_call_expect(0x23,8,10,&p,&n)) return false;
+    r->type=get32(p); r->id=get16(p+4); r->total_len=get16(p+8);
+    r->data=p+10; r->len=n-10;
+    if (get16(p+6)!=index || offset>r->total_len || r->len>r->total_len-offset || r->len>length) { s_error=HOTSYNC_ERR_PROTOCOL; return false; }
+    return true;
+}
+bool hotsync_write_resource(uint8_t handle,uint32_t type,uint16_t id,const uint8_t *data,size_t size) {
+    if (size>65489 || size+16>s_msg_size) { s_error=HOTSYNC_ERR_TOO_LARGE; return false; }
+    uint8_t *a=s_msg+DLP_ARG_OFFSET; memmove(a+10,data,size);
+    a[0]=handle; a[1]=0; put32(a+2,type); put16(a+6,id); put16(a+8,(uint16_t)size);
+    return dlp_call(0x24,(int)(10+size),nullptr,nullptr);
 }

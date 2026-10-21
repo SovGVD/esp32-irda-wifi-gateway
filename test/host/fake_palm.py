@@ -140,8 +140,11 @@ class Link:
 
 
 class Palm:
-    def __init__(self, link, log, outbox, clock, inbox=()):
+    def __init__(self, link, log, outbox, clock, inbox=(), tasks=False, calendar=False, contacts=False):
         self.link = link
+        self.tasks = tasks
+        self.calendar = calendar
+        self.contacts = contacts
         self.clock = clock  # What the handheld's clock shows
         self.log = log
         self.next_id = 0x00A00001
@@ -199,7 +202,7 @@ class Palm:
             return self.reply(command, arg=struct.pack(">HHH", 1, len(data), len(data)) + data)
         if command == 0x17:  # OpenDB
             name = arg[2:].split(b"\0")[0]
-            if name != b"MailDB":
+            if name != (b"AddressDB" if self.contacts else b"DatebookDB" if self.calendar else b"ToDoDB" if self.tasks else b"MailDB"):
                 return self.reply(command, ERR_NOT_FOUND)
             self.cursor = {}
             return self.reply(command, arg=b"\x01")
@@ -213,9 +216,14 @@ class Palm:
             r = matching[position]
             return self.reply(command, arg=struct.pack(">IHHBB", r["id"], self.records.index(r), len(r["data"]),
                                                        r["attr"], r["category"]) + r["data"])
-        if command == 0x20:  # ReadRecord, by id: from an offset, up to a length
-            record_id, offset, length = struct.unpack(">IHH", arg[2:10])
-            found = [r for r in self.records if r["id"] == record_id and not r["attr"] & 0x80]
+        if command == 0x20:  # ReadRecord by ID or index, with offset/length
+            by_index = request[2] & 0x3f == 0x21
+            if by_index:
+                index, offset, length = struct.unpack(">HHH", arg[2:8])
+                found = self.records[index:index+1]
+            else:
+                record_id, offset, length = struct.unpack(">IHH", arg[2:10])
+                found = [r for r in self.records if r["id"] == record_id and not r["attr"] & 0x80]
             if not found:
                 return self.reply(command, ERR_NOT_FOUND)
             r = found[0]
@@ -316,6 +324,9 @@ def main():
     parser.add_argument("--ignore", type=int, action="append", default=[], help="lose the desktop's Nth packet")
     parser.add_argument("--outbox", action="append", default=[], help="file holding one Outbox record")
     parser.add_argument("--inbox", help="JSON file with records already on the handheld")
+    parser.add_argument("--contacts", action="store_true", help="Expose AddressDB instead of MailDB")
+    parser.add_argument("--calendar", action="store_true", help="Expose DatebookDB instead of MailDB")
+    parser.add_argument("--tasks", action="store_true", help="Expose ToDoDB instead of MailDB")
     parser.add_argument("--time", help="what the handheld's clock shows (default: the computer's time)")
     args = parser.parse_args()
 
@@ -326,7 +337,8 @@ def main():
     with open(args.log, "w") as log:
         clock = time.strptime(args.time, "%Y-%m-%d %H:%M:%S") if args.time else None
         inbox = json.load(open(args.inbox)) if args.inbox else []
-        palm = Palm(Link(master, args.drop, args.ignore), log, [open(name, "rb").read() for name in args.outbox], clock, inbox)
+        palm = Palm(Link(master, args.drop, args.ignore), log, [open(name, "rb").read() for name in args.outbox],
+                    clock, inbox=inbox, tasks=args.tasks, calendar=args.calendar, contacts=args.contacts)
         ok = palm.run()
     with open(args.state, "w") as out:
         json.dump({"ok": ok, "ended": palm.ended, "sync_log": palm.sync_log, "tickles": palm.link.tickles,

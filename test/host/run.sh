@@ -11,6 +11,11 @@ out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 flags="-std=c++17 -Wall -Wextra -O1 -g -fsanitize=address,undefined -I$root/include"
 
+sh "$here/xiino.sh"
+
+g++ $flags -o "$out/syncdiagnostics_test" "$here/syncdiagnostics_test.cpp" "$root/src/syncdiagnostics.cpp"
+"$out/syncdiagnostics_test"
+
 g++ $flags -o "$out/mailtext_test" "$here/mailtext_test.cpp" "$root/src/mailtext.cpp"
 g++ $flags -o "$out/mailnet_test" "$here/mailnet_test.cpp" "$root/src/mailnet.cpp" "$root/src/mailoauth.cpp" "$root/src/mailtext.cpp"
 g++ $flags -o "$out/mailoauth_test" "$here/mailoauth_test.cpp" "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" "$root/src/mailtext.cpp"
@@ -89,3 +94,141 @@ for scenario in normal bad-imap offline oauth changes; do
     fi
 done
 echo "mailsync: all passed"
+
+# Google Tasks uses ESP-IDF's bundled cJSON. Build once with pio run first,
+# or point CJSON_DIR to a cJSON source checkout for host-only testing.
+cjson=${CJSON_DIR:-${PLATFORMIO_CORE_DIR:-$HOME/.platformio}/packages/framework-espidf/components/json/cJSON}
+if [ ! -f "$cjson/cJSON.c" ]; then
+    echo "Tasks tests need cJSON: run pio run first or set CJSON_DIR." >&2
+    exit 1
+fi
+cc -O1 -g -fsanitize=address,undefined -I"$cjson" -c "$cjson/cJSON.c" -o "$out/cJSON.o"
+# Exercise the real ESP HTTPS adapter, including Google's long page-token URLs.
+g++ $flags -I"$here/esp_http_stubs" -I"$cjson" -o "$out/googlehttp_test" "$here/googlehttp_test.cpp" \
+    "$root/src/irgooglehttp.cpp" "$root/src/googlecalendar.cpp" "$root/src/calendartext.cpp" \
+    "$root/src/googlecontacts.cpp" "$root/src/contacttext.cpp" "$root/src/googletasks.cpp" \
+    "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$out/cJSON.o"
+"$out/googlehttp_test"
+g++ $flags -I"$cjson" -o "$out/tasksync_test" "$here/tasksync_test.cpp" "$root/src/tasksync.cpp" \
+    "$root/src/googletasks.cpp" "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
+mkfifo "$out/tasks.tty"
+python3 "$here/fake_palm.py" --tasks --log "$out/tasks.log" --state "$out/tasks.json" \
+    > "$out/tasks.tty" 2> "$out/tasks.err" &
+palm_pid=$!
+read tty < "$out/tasks.tty"
+if ! "$out/tasksync_test" "$tty" > "$out/tasks.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/tasks.out" "$out/tasks.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/tasks.out" && grep -q '"ok": true' "$out/tasks.json"
+echo "tasksync: all passed (two-way sync, repeat syncs, pagination, field preservation, failures, deletion)"
+
+# Date Book conduit, using the same fake Palm and the Calendar REST client.
+g++ $flags -I"$cjson" -o "$out/calendarsync_test" "$here/calendarsync_test.cpp" "$root/src/calendartext.cpp" \
+    "$root/src/googlecalendar.cpp" "$root/src/calendarsync.cpp" "$root/src/mailoauth.cpp" \
+    "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
+mkfifo "$out/calendar.tty"
+python3 "$here/fake_palm.py" --calendar --log "$out/calendar.log" --state "$out/calendar.json" \
+    > "$out/calendar.tty" 2> "$out/calendar.err" &
+palm_pid=$!
+read tty < "$out/calendar.tty"
+if ! "$out/calendarsync_test" "$tty" > "$out/calendar.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/calendar.out" "$out/calendar.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/calendar.out" && grep -q '"ok": true' "$out/calendar.json"
+echo "calendarsync: all passed (timed/all-day, alarms, recurrence, DST, journalled inserts, failures, deletion)"
+
+# Address Book conduit and Google People API field-preserving mutations.
+g++ $flags -I"$cjson" -o "$out/contactsync_test" "$here/contactsync_test.cpp" "$root/src/contacttext.cpp" \
+    "$root/src/googlecontacts.cpp" "$root/src/contactsync.cpp" "$root/src/mailoauth.cpp" \
+    "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
+mkfifo "$out/contacts.tty"
+python3 "$here/fake_palm.py" --contacts --log "$out/contacts.log" --state "$out/contacts.json" \
+    > "$out/contacts.tty" 2> "$out/contacts.err" &
+palm_pid=$!
+read tty < "$out/contacts.tty"
+if ! "$out/contactsync_test" "$tty" > "$out/contacts.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/contacts.out" "$out/contacts.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/contacts.out" && grep -q '"ok": true' "$out/contacts.json"
+echo "contactsync: all passed (AddressDB codec, two-way edits, field preservation, identities, conflicts, journalled creation, deletion)"
+
+# Full PDB/PRC backup/restore against multiple RAM databases/resources and a
+# scripted Drive server, including newest-wins replacement and recovery copies.
+g++ $flags -I"$cjson" -o "$out/drivebackup_test" "$here/drivebackup_test.cpp" "$root/src/drivebackup.cpp" \
+    "$root/src/googledrive.cpp" "$root/src/palmbackup.cpp" "$root/src/calendartext.cpp" \
+    "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
+mkfifo "$out/drive.tty"
+python3 "$here/fake_backup_palm.py" --log "$out/drive.log" --state "$out/drive.json" \
+    > "$out/drive.tty" 2> "$out/drive.err" &
+palm_pid=$!
+read tty < "$out/drive.tty"
+if ! "$out/drivebackup_test" "$tty" > "$out/drive.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/drive.out" "$out/drive.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/drive.out" && grep -q '"ok": true' "$out/drive.json"
+echo "drivebackup: all passed (PDB/PRC streaming, folder hierarchy, large resources, newest wins, recovery, interrupted transfers)"
+
+# Exercise the firmware's miniz streaming/allocation path using the SDK's
+# portable miniz implementation. ROM execution still needs device validation.
+miniz=${MINIZ_DIR:-$cjson/../../esptool_py/esptool/flasher_stub}
+if [ ! -f "$miniz/miniz.c" ]; then
+    echo "PNG tests need SDK miniz: run pio run first or set MINIZ_DIR to the flasher_stub source directory." >&2
+    exit 1
+fi
+cc -O1 -g -fsanitize=address,undefined -I"$miniz/include" -c "$miniz/miniz.c" -o "$out/miniz.o"
+g++ $flags -DNOTE_PNG_MINIZ -I"$miniz/include" -o "$out/noteimage_test" \
+    "$here/noteimage_test.cpp" "$root/src/noteimage.cpp" "$out/miniz.o" -lz \
+    -Wl,--wrap=malloc,--wrap=calloc,--wrap=free
+"$out/noteimage_test"
+
+# Memo Pad / Docs and Palm OS 4 Note Pad / PNG two-way application conduits.
+# These end-to-end host tests also check PNG decoding independently with zlib.
+g++ $flags -I"$cjson" -o "$out/notesync_test" "$here/notesync_test.cpp" "$root/src/notetext.cpp" "$root/src/hotsyncuser.cpp" \
+    "$root/src/noteimage.cpp" "$root/src/notesync.cpp" "$root/src/googlenotes.cpp" "$root/src/googledrive.cpp" \
+    "$root/src/calendartext.cpp" "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" "$root/src/mailtext.cpp" \
+    "$root/src/hotsync.cpp" "$out/cJSON.o" -lz
+mkfifo "$out/notes.tty"
+python3 "$here/fake_notes_palm.py" --log "$out/notes.log" --state "$out/notes.json" \
+    > "$out/notes.tty" 2> "$out/notes.err" &
+palm_pid=$!
+read tty < "$out/notes.tty"
+if ! "$out/notesync_test" "$tty" > "$out/notes.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/notes.out" "$out/notes.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/notes.out" && grep -q '"ok": true' "$out/notes.json"
+grep '^Drawing .* memory:' "$out/notes.out"
+echo "notesync: all passed (two-way MemoDB/Docs and OS 4 npadDB/PNG, conflicts, deletion, private records, journals, malformed input)"
+
+# Classic ExpenseDB and Google Sheets, over the real HotSync protocol.
+g++ $flags -I"$cjson" -o "$out/expensesync_test" "$here/expensesync_test.cpp" "$root/src/expensesync.cpp" \
+    "$root/src/expensetext.cpp" "$root/src/googlesheets.cpp" "$root/src/googledrive.cpp" \
+    "$root/src/calendartext.cpp" "$root/src/mailoauth.cpp" "$root/src/mailnet.cpp" \
+    "$root/src/mailtext.cpp" "$root/src/hotsync.cpp" "$out/cJSON.o"
+mkfifo "$out/expenses.tty"
+python3 "$here/fake_expenses_palm.py" --log "$out/expenses.log" --state "$out/expenses.json" \
+    > "$out/expenses.tty" 2> "$out/expenses.err" &
+palm_pid=$!
+read tty < "$out/expenses.tty"
+if ! "$out/expensesync_test" "$tty" > "$out/expenses.out" 2>&1; then
+    kill "$palm_pid" 2>/dev/null || true
+    cat "$out/expenses.out" "$out/expenses.err"
+    exit 1
+fi
+wait "$palm_pid"
+grep -q '^done$' "$out/expenses.out" && grep -q '"ok": true' "$out/expenses.json"
+echo "expensesync: all passed (two-way ExpenseDB/Sheets, exact amounts, field merges, conflicts, deletion, journals, malformed input)"

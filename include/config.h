@@ -112,9 +112,18 @@
 #define PROXY_ALL_SITES_DEFAULT 1                // Setting until changed in the portal
 
 // Xiino can instead send every request to a "DataServer" (its preferences).
-// The original one is gone; the adapter answers under its name. Clearing the
-// DataServer setting in Xiino is the better choice: pages then display cleanly.
+// The original one is gone; the adapter implements OpenXiino's DataServer
+// protocol under its name, including embedded colour mode 9 images.
 #define XIINO_DATASERVER_HOST "pds.mobirus.com"  // Xiino's default; lower case
+#define XIINO_DATASERVER_LEGACY_HOST "pds.ilinx.com"
+#define XIINO_DATASERVER_PORT 4040
+#define XIINO_MAX_SOURCE_BYTES (2 * 1024 * 1024) // Raw scan budget; not retained in RAM
+#define XIINO_MAX_IMAGE_BYTES 64000
+#define XIINO_MAX_IMAGE_PIXELS (153 * 1024)
+#define XIINO_PAGE_TIMEOUT_MS 20000
+#define XIINO_IMAGE_TIMEOUT_MS 5000
+#define XIINO_IMAGES_TIMEOUT_MS 8000
+#define XIINO_MAX_IMAGES 8
 #define PROXY_MAX_PAGE_BYTES  48000              // Longer pages are cut off
 #define PROXY_MAX_REDIRECTS   4
 #define PROXY_TIMEOUT_MS      12000              // Connecting, and waiting for data
@@ -167,12 +176,54 @@
 // Google sign-in (OAuth) instead of an app password, for Gmail. The owner
 // signs in once from a PC on the same Wi-Fi: "Sign in with Google" on the
 // Mail page opens the adapter's sign-in page to the Wi-Fi side for this long.
-// Only the mail scope for now; adding scopes later means signing in again.
-#define GOOGLE_SCOPES              "https://mail.google.com/"
+// Request all eight configured Google services together. Existing tokens
+// keep their original grants until the owner signs in again.
+#include "googlescopes.h"
+#define GOOGLE_SCOPES              GOOGLE_DEFAULT_SCOPES
 #define GOOGLE_SETUP_WINDOW_MS     (15UL * 60 * 1000)
 
 // Time server; message dates are converted to the time shown by the Palm's clock
 #define MAIL_NTP_SERVER            "pool.ntp.org"
+
+// ==============================================================================
+// Google Tasks (Palm To Do List, alongside standalone Mail)
+// ==============================================================================
+#define TASKS_MAX_PER_SYNC         100
+#define TASKS_HTTP_TIMEOUT_MS      12000
+#define TASKS_HTTP_RESPONSE_MAX    24000
+
+// ==============================================================================
+// Google Calendar (Palm Date Book, alongside Mail and Tasks)
+// ==============================================================================
+#define CALENDAR_MAX_PER_SYNC       64
+#define CALENDAR_PAST_DAYS          30
+#define CALENDAR_FUTURE_DAYS        90
+#define CALENDAR_HTTP_TIMEOUT_MS    12000
+#define CALENDAR_HTTP_RESPONSE_MAX  32000
+
+// Google Contacts (classic Palm Address Book, shared Google sign-in)
+#define CONTACTS_MAX_PER_SYNC       64
+#define CONTACTS_HTTP_TIMEOUT_MS    12000
+#define CONTACTS_HTTP_RESPONSE_MAX  32000
+
+// Memo Pad / Google Docs and Palm OS 4 Note Pad / Drive PNG sync.
+#define NOTES_MAX_PER_SYNC         64
+#define NOTES_CONTENT_MEMORY       64000 // retained content; drawings keep metadata + one active bitmap
+#define NOTES_HTTP_TIMEOUT_MS      20000
+#define NOTES_HTTP_RESPONSE_MAX    32768
+
+// Classic ExpenseDB / Google Sheets, using the existing shared authorization.
+#define EXPENSES_MAX_PER_SYNC       64
+#define EXPENSES_CONTENT_MEMORY     24000 // combined Palm + Sheets content
+#define EXPENSES_HTTP_TIMEOUT_MS    20000
+#define EXPENSES_HTTP_RESPONSE_MAX  48000
+
+// Google Drive: full RAM database/application backup and PDB/PRC installs.
+#define DRIVE_MAX_DATABASES         512
+#define DRIVE_MAX_FILES             512
+#define DRIVE_FOLDER_MEMORY         64000
+#define DRIVE_HTTP_TIMEOUT_MS       20000
+#define DRIVE_HTTP_RESPONSE_MAX     32000
 
 // ==============================================================================
 // Debug Logging
